@@ -24,6 +24,12 @@ Bez reálných dat si můžete vygenerovat ukázkovou sérii:
 py tools\make_demo_series.py --out "%USERPROFILE%\Downloads\demo_darkfield" --frames 40
 ```
 
+> 📖 **Chcete rozumět tomu, jak analýza doopravdy pracuje?**
+> [**docs/JAK_TO_FUNGUJE.md**](docs/JAK_TO_FUNGUJE.md) je podrobný výklad celého
+> řetězce od načtení fotky po klasifikaci kontaminace — s kusy skutečného kódu,
+> odvozením použitých vzorců, obrázky jednotlivých kroků a kapitolou o tom, kde
+> má metoda hranice.
+
 ---
 
 ## Co bylo opraveno oproti předchozí verzi
@@ -270,6 +276,9 @@ Nejdůležitější přepínače (`py main.py --help` vypíše všechny):
 
 ## Metodika
 
+> Tohle je jen shrnutí. Podrobný výklad s kódem, odvozením vzorců a obrázky
+> najdete v [docs/JAK_TO_FUNGUJE.md](docs/JAK_TO_FUNGUJE.md).
+
 ### Zpracování jednoho snímku
 
 1. Načtení a převod na float32 v jednotné škále 0–255 ADU.
@@ -311,7 +320,10 @@ viewer.py                prohlížeč snímků s klasifikační maskou
 help_text.py             text nápovědy zobrazený v GUI
 main.py                  spuštění GUI i dávkové analýzy z příkazové řádky
 tools/make_demo_series.py generátor ukázkové série
+tools/make_docs_figures.py generátor obrázků do dokumentace
 tests/                   automatické testy (pytest)
+docs/JAK_TO_FUNGUJE.md   podrobný výklad analýzy (jak a proč to funguje)
+docs/img/                obrázky do dokumentace
 ```
 
 ## Testy
@@ -321,6 +333,6 @@ py -m pip install pytest
 py -m pytest -q
 ```
 
-88 testů pokrývá jádro, výběr reference, barevné snímky, export i grafické
+95 testů pokrývá jádro, výběr reference, barevné snímky, export i grafické
 rozhraní (běží bez obrazovky přes `QT_QPA_PLATFORM=offscreen`), včetně regresí
 na všechny tři výše popsané pády.

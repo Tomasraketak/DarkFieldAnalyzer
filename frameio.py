@@ -50,9 +50,13 @@ DISPLAY_FULL_SCALE = 255.0
 #: * ``luma``    – vážený jas Rec.601 (0,299 R + 0,587 G + 0,114 B). Standardní
 #:                 „černobílý“ převod, který používá i sama kamera.
 #: * ``prumer``  – prostý průměr kanálů. Nepodceňuje modrou, takže modravé
-#:                 rozptylové halo částic v temném poli má plnou váhu.
-#: * ``maximum`` – maximum kanálů. Nejcitlivější na částice, které svítí jen
-#:                 v jednom kanálu, ale zvyšuje i šum pozadí (√3× u nekorelovaného šumu).
+#:                 rozptylové halo částic v temném poli má plnou váhu, a u
+#:                 nezávislého šumu zmenší σ až √3× (u demozaikovaného snímku
+#:                 méně – kanály jsou korelované).
+#: * ``maximum`` – maximum kanálů. Nejcitlivější na částice svítící jen v jednom
+#:                 kanálu. Rozdělení šumu je pak ale zešikmené doprava (medián
+#:                 leží asi 0,8 σ nad nulou a pravý ocas je těžší než u Gaussovy
+#:                 křivky), takže při stejné sigmě propustí víc falešných detekcí.
 #: * ``r`` / ``g`` / ``b`` – jediný kanál.
 MONO_MODES: Tuple[str, ...] = ("luma", "prumer", "maximum", "r", "g", "b")
 DEFAULT_MONO_MODE = "luma"
