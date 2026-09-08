@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.idea/
+.vscode/
+
+# Výstupy analýz a demo data
+analyza_*.csv
+*_grafy.png
+*_souhrn.json
+demo_darkfield/

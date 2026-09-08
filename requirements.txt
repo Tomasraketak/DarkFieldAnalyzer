@@ -1,0 +1,15 @@
+# Knihovny pro Dark-Field Contamination Analyzer
+# Testováno na Windows 11 / Python 3.10–3.13 (Dell Vostro 7500, i7, 16 GB RAM)
+
+# Zpracování obrazu a výpočty
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Grafické rozhraní
+PyQt6>=6.5.0
+
+# Grafy
+matplotlib>=3.7.0
+
+# Testy (volitelné – jen pro spuštění py -m pytest)
+# pytest>=7.4.0
