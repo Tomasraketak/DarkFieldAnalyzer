@@ -228,3 +228,77 @@ def test_gui_roi_checkbox_controls_params(app):
         box.setValue(value)
     assert window.get_current_params().roi == (10, 20, 640, 480)
     window.close()
+
+
+def test_composition_series_is_disjoint_and_ordered(series):
+    from exporter import COMPOSITION_LAYERS, composition_series
+
+    result, _folder = series
+    layers = composition_series(result.metrics)
+
+    assert [label for label, _color, _values in layers] == [
+        label for _attr, label, _color in COMPOSITION_LAYERS
+    ]
+    assert len({color for _label, color, _values in layers}) == 4
+    for index, metrics in enumerate(result.metrics):
+        total = sum(values[index] for _label, _color, values in layers)
+        assert total == pytest.approx(metrics.total_coverage_pct, abs=1e-6)
+
+
+def test_composition_plot_draws_all_layers(series):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from exporter import plot_composition
+
+    result, _folder = series
+    fig = plt.figure(figsize=(8, 8))
+    grid = fig.add_gridspec(3, 1)
+    ax_area = fig.add_subplot(grid[0, 0])
+    ax_particles = fig.add_subplot(grid[1, 0])
+    ax_share = fig.add_subplot(grid[2, 0])
+
+    plot_composition(ax_area, ax_share, result.metrics, ax_particles=ax_particles)
+
+    assert len(ax_area.collections) == 4          # čtyři vrstvy
+    assert len(ax_particles.collections) == 3     # bez zamlžení
+    assert len(ax_share.patches) == 4             # čtyři segmenty pruhu
+    assert ax_area.get_legend() is not None
+    plt.close(fig)
+
+
+def test_summary_contains_composition(series):
+    result, _folder = series
+    data = summarize(result)
+    composition = data["slozeni_prumerne_pokryti_pct"]
+    assert len(composition) == 4
+    assert sum(composition.values()) == pytest.approx(
+        sum(m.total_coverage_pct for m in result.metrics) / len(result.metrics), abs=1e-3
+    )
+
+
+def test_gui_has_composition_tab(app, tmp_path_factory):
+    import gui as gui_module
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    assert any("Složení" in title for title in titles)
+    window.close()
+
+
+def test_default_base_dir_prefers_bms_folder(monkeypatch):
+    import gui as gui_module
+
+    monkeypatch.setattr(os.path, "isdir", lambda path: path == gui_module.DEFAULT_BASE_DIR)
+    assert gui_module.default_base_dir() == gui_module.DEFAULT_BASE_DIR
+    assert gui_module.DEFAULT_BASE_DIR == r"C:\Users\Programovani\Downloads\BMS fotky"
+
+
+def test_default_base_dir_falls_back_when_missing(monkeypatch):
+    import gui as gui_module
+
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(os.path, "isdir", lambda path: path == home)
+    assert gui_module.default_base_dir() == home

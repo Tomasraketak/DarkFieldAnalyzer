@@ -59,13 +59,30 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.figure import Figure
 
 from analyzer import AnalysisParams, FrameMetrics, SeriesResult, analyze_series
-from exporter import export_all, summarize
+from exporter import export_all, plot_composition, summarize
 from frameio import list_image_files, list_measurement_folders
 from help_text import HELP_HTML
 from viewer import ImageViewerWidget
 
 APP_ORG = "DarkFieldAnalyzer"
 APP_NAME = "DarkFieldAnalyzer"
+
+#: Výchozí kořenová složka s měřeními (počítač, pro který je aplikace určená).
+DEFAULT_BASE_DIR = r"C:\Users\Programovani\Downloads\BMS fotky"
+
+
+def default_base_dir() -> str:
+    """Vrátí výchozí složku s měřeními, případně nejbližší existující náhradu."""
+    candidates = [
+        DEFAULT_BASE_DIR,
+        os.path.join(os.path.expanduser("~"), "Downloads", "BMS fotky"),
+        os.path.join(os.path.expanduser("~"), "Downloads"),
+        os.path.expanduser("~"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.expanduser("~")
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +161,7 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.settings = QSettings(APP_ORG, APP_NAME)
         self.current_base_dir = self.settings.value("base_dir", "", type=str)
         if not self.current_base_dir or not os.path.isdir(self.current_base_dir):
-            fallback = os.path.join(os.path.expanduser("~"), "Downloads")
-            self.current_base_dir = fallback if os.path.isdir(fallback) else os.path.expanduser("~")
+            self.current_base_dir = default_base_dir()
 
         self.selected_folder_path: Optional[str] = None
         self.current_image_paths: List[str] = []
@@ -412,6 +428,9 @@ class DarkfieldAnalyzerGUI(QMainWindow):
 
         self.fig_rates = Figure(figsize=(7, 5), dpi=100)
         self.canvas_rates = self._add_plot_tab(self.fig_rates, "⚡ Rychlost a nehomogenita")
+
+        self.fig_composition = Figure(figsize=(7, 7), dpi=100)
+        self.canvas_composition = self._add_plot_tab(self.fig_composition, "🧩 Složení kontaminace")
 
         self.viewer_widget = ImageViewerWidget()
         self.tabs.addTab(self.viewer_widget, "🖼️ Vizuální kontrola")
@@ -768,6 +787,18 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         ax.set_title("Dynamika změn v čase a prostorová nehomogenita", fontsize=12, fontweight="bold")
         self.fig_rates.tight_layout()
         self.canvas_rates.draw_idle()
+
+        # Složení kontaminace: kolik procent plochy zabírá který typ
+        self.fig_composition.clear()
+        grid = self.fig_composition.add_gridspec(3, 1, height_ratios=[1, 1, 0.3], hspace=0.62)
+        plot_composition(
+            self.fig_composition.add_subplot(grid[0, 0]),
+            self.fig_composition.add_subplot(grid[2, 0]),
+            res,
+            ax_particles=self.fig_composition.add_subplot(grid[1, 0]),
+        )
+        self.fig_composition.subplots_adjust(left=0.1, right=0.97, top=0.94, bottom=0.08)
+        self.canvas_composition.draw_idle()
 
     def populate_results_table(self) -> None:
         if not self.current_result:

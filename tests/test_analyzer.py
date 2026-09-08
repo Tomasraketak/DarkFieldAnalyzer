@@ -471,3 +471,31 @@ def test_roi_limits_analysis_to_selected_area():
     assert metrics.point_count == 1
     assert cropped_image.shape == (120, 160)
     assert analyze(inside, params=params_full)[0].point_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Rozklad pokrytí podle typů
+# ---------------------------------------------------------------------------
+
+def test_composition_components_sum_to_total_coverage():
+    """Složky musí být disjunktní – jinak by graf složení lhal.
+
+    Maska oparu a masky částic se překrývají, proto se opar pro rozklad počítá
+    bez plochy částic.
+    """
+    image = make_frame(dots=[(60, 60), (150, 90)], disks=[(200, 150, 11)],
+                       lines=[(40, 180, 120, 220)], haze=18.0, noise=1.0, seed=3)
+    bias = make_frame(noise=1.0, seed=4)
+    metrics, _ = analyze(np.clip(image + bias, 0, 255), bias=bias)
+
+    parts = (metrics.haze_only_coverage_pct + metrics.point_area_pct
+             + metrics.cluster_area_pct + metrics.fiber_area_pct)
+    assert parts == pytest.approx(metrics.total_coverage_pct, abs=1e-6)
+    assert metrics.haze_only_coverage_pct <= metrics.haze_coverage_pct + 1e-9
+    assert metrics.total_coverage_pct > 0
+
+
+def test_haze_only_is_zero_without_haze():
+    metrics, _ = analyze(make_frame(dots=[(60, 60), (150, 90)]))
+    assert metrics.haze_only_coverage_pct == pytest.approx(0.0, abs=1e-6)
+    assert metrics.point_area_pct > 0

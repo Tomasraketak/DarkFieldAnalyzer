@@ -95,7 +95,21 @@ rozptyluje světlo do objektivu a září.</p>
     <b>pod 80:</b> znečištěné sklíčko.
 </div>
 
-<h3>9. Ostrost a šum pozadí (kontrola kvality měření)</h3>
+<h3>9. Složení kontaminace (záložka 🧩)</h3>
+<div class="box">
+    <b>Co ukazuje:</b> kolik procent plochy snímku zabírá který typ kontaminace, v čase.
+    Vrstvy jsou <b>disjunktní</b> – zamlžení se počítá bez plochy, na které leží částice –
+    takže jejich součet je přesně celkové pokrytí.<br>
+    <b>Proč jsou grafy dva:</b> zamlžení se měří jako plocha nad prahem 4 ADU, takže při
+    zapaření zabere klidně 90 % snímku, zatímco částice bývají v desetinách procenta.
+    Druhý graf proto ukazuje totéž <i>bez zamlžení</i> ve vlastním měřítku.<br>
+    <b>Pruh dole:</b> průměrné zastoupení typů v kontaminované ploše (dohromady 100 %).<br>
+    Barvy odpovídají barvám v prohlížeči snímků. V CSV najdete sloupce
+    <code>Pokrytí zamlžením bez částic [%]</code>, <code>Pokrytí mikročásticemi [%]</code>,
+    <code>Pokrytí shluky [%]</code> a <code>Pokrytí vlákny [%]</code>.
+</div>
+
+<h3>10. Ostrost a šum pozadí (kontrola kvality měření)</h3>
 <div class="box">
     <b>Ostrost</b> (variance Laplaciánu) prudce klesne, pokud se mikroskop rozostří nebo
     dojde k otřesu – takový snímek nemá smysl porovnávat se zbytkem řady.<br>
@@ -103,7 +117,7 @@ rozptyluje světlo do objektivu a září.</p>
     detekce (<code>práh = medián + sigma × σ</code>).
 </div>
 
-<h3>10. Rychlost změny (d/dt) a fáze děje</h3>
+<h3>11. Rychlost změny (d/dt) a fáze děje</h3>
 <div class="warn">
     Derivace se počítá lokální lineární regresí přes 5 snímků, ne rozdílem sousedních –
     u rychlých sérií tak nezesiluje šum.<br>
@@ -112,7 +126,7 @@ rozptyluje světlo do objektivu a září.</p>
     • <b class="green">Stabilní:</b> beze změny nad úrovní šumu.
 </div>
 
-<h3>11. Co dělat, když výsledky nesedí</h3>
+<h3>12. Co dělat, když výsledky nesedí</h3>
 <table>
 <tr><th>Projev</th><th>Řešení</th></tr>
 <tr><td>Tisíce „částic“ i na čistém sklíčku</td>

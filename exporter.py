@@ -13,7 +13,7 @@ import math
 import os
 from dataclasses import asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -38,6 +38,7 @@ CSV_COLUMNS: List[tuple] = [
     ("Plocha celkem [px]", "total_area_px", "{:d}"),
     ("Plocha celkem [µm²]", "total_area_um2", "{:.2f}"),
     ("Pokrytí zamlžením [%]", "haze_coverage_pct", "{:.4f}"),
+    ("Pokrytí zamlžením bez částic [%]", "haze_only_coverage_pct", "{:.4f}"),
     ("Průměr zamlžení [ADU]", "haze_mean_adu", "{:.2f}"),
     ("Max zamlžení [ADU]", "haze_max_adu", "{:.2f}"),
     ("Mikročástic [ks]", "point_count", "{:d}"),
@@ -168,7 +169,12 @@ def summarize(result: SeriesResult) -> Dict[str, object]:
         phases[m.phase] = phases.get(m.phase, 0) + 1
 
     duration = metrics[-1].time_s - metrics[0].time_s
+    composition = {
+        label: round(sum(values) / len(values), 4) if values else 0.0
+        for label, _color, values in composition_series(metrics)
+    }
     return {
+        "slozeni_prumerne_pokryti_pct": composition,
         "pocet_snimku": len(metrics),
         "delka_mereni_s": round(duration, 3),
         "pokryti_prumer_pct": round(sum(coverage) / len(coverage), 4),
@@ -210,6 +216,128 @@ def export_summary_json(result: SeriesResult, output_path: str, folder_name: str
 # Grafy
 # ---------------------------------------------------------------------------
 
+#: Kategorie kontaminace pro graf složení plochy.
+#:
+#: Pořadí je zároveň pořadím vrstev zdola nahoru: usazené částice tvoří
+#: stabilní základ, proměnlivý opar leží nahoře. Barvy odpovídají barvám
+#: v prohlížeči snímků (shluky červeně, mikročástice žlutooranžově, vlákna
+#: zeleně, zamlžení modře) a jsou zvolené tak, aby sousední vrstvy zůstaly
+#: rozlišitelné i při barvosleposti – červená a zelená proto nikdy nesousedí.
+COMPOSITION_LAYERS = [
+    ("cluster_area_pct", "Velké shluky / kapky", "#B03A2E"),
+    ("point_area_pct", "Mikročástice (prach)", "#D4900A"),
+    ("fiber_area_pct", "Vlákna / škrábance", "#1D8348"),
+    ("haze_only_coverage_pct", "Difuzní zamlžení", "#2E86C1"),
+]
+
+#: Barva pozadí grafu – používá se i jako mezera mezi vrstvami.
+SURFACE_COLOR = "#FFFFFF"
+
+
+def composition_series(metrics: Sequence[FrameMetrics]) -> List[Tuple[str, str, List[float]]]:
+    """Vrátí data pro graf složení jako ``[(popis, barva, hodnoty v %), ...]``.
+
+    Složky jsou disjunktní (opar se počítá bez plochy částic), takže jejich
+    součet je přesně celkové pokrytí snímku.
+    """
+    return [
+        (label, color, [getattr(m, attr) for m in metrics])
+        for attr, label, color in COMPOSITION_LAYERS
+    ]
+
+
+def plot_composition(
+    ax_area,
+    ax_share,
+    metrics: Sequence[FrameMetrics],
+    ax_particles=None,
+) -> None:
+    """Vykreslí složení kontaminace.
+
+    ``ax_area``      – vrstvený graf pokrytí plochy [% snímku] v čase,
+    ``ax_share``     – průměrné zastoupení typů v kontaminované ploše [%],
+    ``ax_particles`` – volitelně tentýž graf bez zamlžení.
+
+    Samostatný panel bez zamlžení má svůj důvod: opar se počítá jako plocha nad
+    prahem 4 ADU, takže při zapaření zabere klidně 90 % snímku, zatímco částice
+    bývají v desetinách procenta. Ve společném lineárním grafu by tenké vrstvy
+    zanikly a nešly by odečíst.
+    """
+    metrics = list(metrics)
+    times = [m.time_s for m in metrics]
+    layers = composition_series(metrics)
+    means = [sum(values) / len(values) if values else 0.0 for _label, _color, values in layers]
+
+    ax_area.stackplot(
+        times,
+        *[values for _label, _color, values in layers],
+        # V legendě je rovnou i průměrné pokrytí – u tenkých vrstev je to
+        # jediné místo, kde se jejich hodnota dá přečíst.
+        labels=[f"{label}  (⌀ {mean:.3f} %)" for (label, _color, _values), mean in zip(layers, means)],
+        colors=[color for _label, color, _values in layers],
+        edgecolor=SURFACE_COLOR,
+        linewidth=1.2,          # 2px mezera mezi vrstvami při běžném DPI
+    )
+    ax_area.set_xlabel("Čas od počátku [s]", fontweight="bold")
+    ax_area.set_ylabel("Pokrytí plochy snímku [%]", fontweight="bold")
+    ax_area.grid(True, linestyle="--", alpha=0.4)
+    ax_area.margins(x=0)
+    ax_area.set_ylim(bottom=0)
+
+    handles, labels_text = ax_area.get_legend_handles_labels()
+    ax_area.legend(handles[::-1], labels_text[::-1], loc="best", fontsize=9, frameon=True, framealpha=0.92)
+    ax_area.set_title(
+        "Podíl jednotlivých typů kontaminace na ploše snímku",
+        fontsize=11, fontweight="bold",
+    )
+
+    if ax_particles is not None:
+        solid = [layer for layer in layers if layer[0] != COMPOSITION_LAYERS[-1][1]]
+        ax_particles.stackplot(
+            times,
+            *[values for _label, _color, values in solid],
+            labels=[label for label, _color, _values in solid],
+            colors=[color for _label, color, _values in solid],
+            edgecolor=SURFACE_COLOR,
+            linewidth=1.2,
+        )
+        ax_particles.set_xlabel("Čas od počátku [s]", fontweight="bold")
+        ax_particles.set_ylabel("Pokrytí plochy snímku [%]", fontweight="bold")
+        ax_particles.grid(True, linestyle="--", alpha=0.4)
+        ax_particles.margins(x=0)
+        ax_particles.set_ylim(bottom=0)
+        handles_p, labels_p = ax_particles.get_legend_handles_labels()
+        ax_particles.legend(handles_p[::-1], labels_p[::-1], loc="best", fontsize=9,
+                            frameon=True, framealpha=0.92)
+        ax_particles.set_title(
+            "Totéž bez zamlžení – jen pevné částice (jiné měřítko osy Y)",
+            fontsize=11, fontweight="bold",
+        )
+
+    # Průměrné zastoupení v kontaminované ploše (vodorovný vrstvený pruh)
+    total = sum(means)
+    left = 0.0
+    for (label, color, _values), mean_pct in zip(layers, means):
+        share = 100.0 * mean_pct / total if total > 0 else 0.0
+        ax_share.barh(0, share, left=left, color=color, edgecolor=SURFACE_COLOR, height=0.55, linewidth=1.2)
+        if share >= 4.0:        # popisek přímo v pruhu, jen když se tam vejde
+            ax_share.text(
+                left + share / 2.0, 0, f"{share:.0f} %",
+                ha="center", va="center", fontsize=9, fontweight="bold", color="#FFFFFF",
+            )
+        left += share
+
+    ax_share.set_xlim(0, 100)
+    ax_share.set_ylim(-0.5, 0.5)
+    ax_share.set_yticks([])
+    ax_share.set_xlabel("Zastoupení v kontaminované ploše [%]", fontweight="bold")
+    ax_share.grid(True, axis="x", linestyle="--", alpha=0.4)
+    ax_share.set_axisbelow(True)
+    ax_share.set_title(
+        f"Průměrné zastoupení typů  (kontaminace celkem ⌀ {total:.3f} % plochy)",
+        fontsize=9.5, fontweight="bold",
+    )
+
 def _shade_phases(ax, metrics: Sequence[FrameMetrics]) -> None:
     """Podbarví oblasti nárůstu (červeně) a ústupu (modře)."""
     colors = {"nárůst / zamlžování": ("#C0392B", 0.08), "odpařování / ústup": ("#2980B9", 0.08)}
@@ -236,7 +364,16 @@ def export_summary_plots(
     metrics = list(metrics_list)
     times = [m.time_s for m in metrics]
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+    fig = plt.figure(figsize=(12, 20))
+    # Předposlední řádek je jen mezera, aby popisek osy 6. panelu nenarazil
+    # do titulku pruhu se zastoupením typů.
+    grid = fig.add_gridspec(
+        8, 1, height_ratios=[1, 1, 1, 1, 1, 1, 0.16, 0.32],
+        hspace=0.34, top=0.965, bottom=0.04, left=0.085, right=0.93,
+    )
+    axes = [fig.add_subplot(grid[0, 0])]
+    axes += [fig.add_subplot(grid[i, 0], sharex=axes[0]) for i in range(1, 6)]
+    ax_share = fig.add_subplot(grid[7, 0])
     fig.suptitle(title, fontsize=15, fontweight="bold", y=0.995)
 
     # 1. Pokrytí a skóre čistoty
@@ -303,10 +440,16 @@ def export_summary_plots(
     ax4_twin.tick_params(axis="y", labelcolor="#2C3E50")
     ax4_twin.set_ylim(0, 105)
     ax4.legend(lines4, [l.get_label() for l in lines4], loc="upper right", frameon=True, fontsize=9)
-    ax4.set_xlabel("Čas od počátku [s]", fontsize=10, fontweight="bold")
     ax4.set_title("4. Dynamika děje a prostorová nehomogenita (podbarveno podle fáze)", fontsize=11, fontweight="bold")
 
-    fig.tight_layout(rect=(0, 0, 1, 0.985))
+    # 5. a 6. Složení kontaminace podle typu
+    ax5, ax6 = axes[4], axes[5]
+    plot_composition(ax5, ax_share, metrics, ax_particles=ax6)
+    ax5.set_title("5. Podíl typů kontaminace na ploše snímku", fontsize=11, fontweight="bold")
+    ax5.set_xlabel("")
+    ax6.set_title("6. Totéž bez zamlžení – jen pevné částice", fontsize=11, fontweight="bold")
+    ax6.set_xlabel("Čas od počátku [s]", fontsize=10, fontweight="bold")
+
     directory = os.path.dirname(os.path.abspath(output_image_path))
     if directory:
         os.makedirs(directory, exist_ok=True)

@@ -92,6 +92,7 @@ Další opravené problémy:
 | Ekvivalentní průměr částice [µm] | fyzikální velikost při zadané kalibraci |
 | Celková délka vláken [px] | míra „vlákitosti“ znečištění |
 | Ostrost (variance Laplaciánu) | odhalí rozostřený snímek nebo otřes stativu |
+| Pokrytí zamlžením bez částic [%] | disjunktní rozklad pokrytí pro graf složení |
 | Úroveň pozadí a SNR | kontrola stability osvětlení a expozice |
 | Šum pozadí σ a použitý práh | doložitelnost detekční meze v protokolu |
 
@@ -129,7 +130,9 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
 
 **Levý panel**
 
-1. **Složka s měřeními** – tlačítkem *Procházet…* vyberte kořenovou složku.
+1. **Složka s měřeními** – výchozí cesta je
+   `C:\Users\Programovani\Downloads\BMS fotky`; tlačítkem *Procházet…* vyberete jinou
+   (naposledy zvolená se pamatuje).
    V seznamu se objeví všechny podsložky se snímky **i samotná zvolená složka**,
    pokud snímky obsahuje přímo (dřív se nezobrazila a vypadalo to, že tam nic není).
 2. **Parametry analýzy** – rozlišení/binning, počet a metoda bias snímků, režim a
@@ -142,6 +145,10 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
 
 - 📈 Pokrytí a čistota · 🔬 Typy kontaminace · 💡 Signál a hotspoty ·
   ⚡ Rychlost a nehomogenita
+- 🧩 **Složení kontaminace** – vrstvený graf, kolik procent plochy snímku zabírá
+  který typ (shluky, mikročástice, vlákna, zamlžení), druhý panel totéž bez
+  zamlžení ve vlastním měřítku a dole pruh s průměrným zastoupením typů.
+  Vrstvy jsou disjunktní, takže jejich součet je přesně celkové pokrytí.
 - 🖼️ **Vizuální kontrola** – posuvník přes snímky, šest režimů zobrazení
   (barevná klasifikace, originál, diference, opar, ostrá složka, binární maska),
   uložení náhledu do PNG.

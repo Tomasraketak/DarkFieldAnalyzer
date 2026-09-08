@@ -144,7 +144,8 @@ class FrameMetrics:
     snr: float                         # průměrný signál / šum pozadí
 
     # Difuzní zamlžení / kondenzace
-    haze_coverage_pct: float
+    haze_coverage_pct: float           # celá plocha oparu (i tam, kde leží částice)
+    haze_only_coverage_pct: float      # plocha oparu bez částic – složky se sčítají na celkové pokrytí
     haze_mean_adu: float
     haze_max_adu: float
 
@@ -594,6 +595,15 @@ def analyze_prepared_frame(
     total_area_px_binned = int(mask_total.sum())
     total_coverage_pct = 100.0 * total_area_px_binned / total_pixels if total_pixels else 0.0
 
+    # Plocha oparu bez částic. Masky se překrývají (částice leží i uvnitř oparu),
+    # takže pro grafy složení je potřeba disjunktní rozklad: součet
+    # „opar bez částic + mikročástice + shluky + vlákna“ dá přesně celkové pokrytí.
+    particle_area_binned = (
+        particles.point_area_px + particles.cluster_area_px + particles.fiber_area_px
+    )
+    haze_only_px = max(0, total_area_px_binned - particle_area_binned)
+    haze_only_coverage_pct = 100.0 * haze_only_px / total_pixels if total_pixels else 0.0
+
     # --- signál ------------------------------------------------------------
     if total_area_px_binned:
         integrated = float(np.sum(diff, where=mask_total, dtype=np.float64))
@@ -652,6 +662,7 @@ def analyze_prepared_frame(
         applied_threshold=applied_threshold,
         snr=snr,
         haze_coverage_pct=haze_coverage_pct,
+        haze_only_coverage_pct=haze_only_coverage_pct,
         haze_mean_adu=haze_mean_adu,
         haze_max_adu=haze_max_adu,
         point_count=particles.point_count,
