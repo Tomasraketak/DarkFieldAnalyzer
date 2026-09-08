@@ -60,7 +60,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-from analyzer import AnalysisParams, FrameMetrics, SeriesResult, analyze_series
+from analyzer import AnalysisParams, FrameMetrics, SeriesResult, analyze_series, resolve_reference
 from exporter import export_all, plot_composition, summarize
 from frameio import list_image_files, list_measurement_folders
 from help_text import HELP_HTML
@@ -71,6 +71,19 @@ APP_NAME = "DarkFieldAnalyzer"
 
 #: Výchozí kořenová složka s měřeními (počítač, pro který je aplikace určená).
 DEFAULT_BASE_DIR = r"C:\Users\Programovani\Downloads\BMS fotky"
+
+#: Volby režimu referenčního pozadí – pořadí odpovídá položkám v rozbalovacím seznamu.
+REFERENCE_MODES: Tuple[str, ...] = ("auto", "reference", "serie")
+
+#: Volby převodu barevného snímku na intenzitu (klíč pro ``AnalysisParams.mono_mode``).
+MONO_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("luma", "Vážený jas – Rec.601 (doporučeno)"),
+    ("prumer", "Průměr kanálů"),
+    ("maximum", "Maximum kanálů"),
+    ("r", "Jen červený kanál"),
+    ("g", "Jen zelený kanál"),
+    ("b", "Jen modrý kanál"),
+)
 
 
 def default_base_dir() -> str:
@@ -166,6 +179,7 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             self.current_base_dir = default_base_dir()
 
         self.selected_folder_path: Optional[str] = None
+        self.reference_dir_override: Optional[str] = None
         self.current_image_paths: List[str] = []
         self.current_result: Optional[SeriesResult] = None
         self.worker: Optional[AnalysisWorker] = None
@@ -289,6 +303,57 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         dir_layout.addWidget(btn_refresh)
         column.addWidget(dir_group)
 
+        # 1b. Referenční pozadí ----------------------------------------------
+        ref_group = QGroupBox("1b. Referenční pozadí (bias)")
+        ref_layout = QVBoxLayout(ref_group)
+        ref_layout.setSpacing(4)
+
+        self.combo_reference = QComboBox()
+        self.combo_reference.addItems([
+            "Automaticky – reference ze složky, jinak série",
+            "Vždy ze složky s referencemi",
+            "Vždy z prvních snímků série",
+        ])
+        self.combo_reference.setToolTip(
+            "Reference (.npz z BMS Cam Control) se hledá ve složce „reference“\n"
+            "vedle měření. Vybere se ta, která vznikla naposledy PŘED měřením."
+        )
+        self.combo_reference.currentIndexChanged.connect(self.update_reference_preview)
+        ref_layout.addWidget(self.combo_reference)
+
+        row = QHBoxLayout()
+        self.lbl_reference_dir = QLabel("(hledá se automaticky)")
+        self.lbl_reference_dir.setStyleSheet("font-size: 10px; color: #555;")
+        self.lbl_reference_dir.setMinimumWidth(100)
+        row.addWidget(self.lbl_reference_dir, 1)
+        btn_ref_dir = QPushButton("Složka…")
+        btn_ref_dir.setToolTip("Ručně určit složku s .npz referencemi.")
+        btn_ref_dir.clicked.connect(self.browse_reference_dir)
+        row.addWidget(btn_ref_dir)
+        btn_ref_auto = QPushButton("Auto")
+        btn_ref_auto.setToolTip("Zrušit ruční volbu a hledat složku „reference“ automaticky.")
+        btn_ref_auto.clicked.connect(self.clear_reference_dir)
+        row.addWidget(btn_ref_auto)
+        ref_layout.addLayout(row)
+
+        self.lbl_reference_pick = QLabel("Vyberte složku s měřením.")
+        self.lbl_reference_pick.setWordWrap(True)
+        self.lbl_reference_pick.setStyleSheet(
+            "font-size: 10px; color: #1D3B5C; background: #EAF2FA; padding: 4px; border-radius: 4px;"
+        )
+        ref_layout.addWidget(self.lbl_reference_pick)
+
+        self.chk_match_level = QCheckBox("Srovnat úroveň reference se snímky")
+        self.chk_match_level.setChecked(True)
+        self.chk_match_level.setToolTip(
+            "Reference vznikla dřív, takže se od snímků může lišit konstantním\n"
+            "posunem jasu (teplota senzoru, jas zdroje). Bez srovnání se takový\n"
+            "posun projeví jako plošné zamlžení přes celý snímek.\n"
+            "Posun se odhaduje jednou pro celou sérii z nejtmavšího snímku."
+        )
+        ref_layout.addWidget(self.chk_match_level)
+        column.addWidget(ref_group)
+
         # 2. Parametry --------------------------------------------------------
         # Jeden sloupec (QFormLayout): dvojice ovládacích prvků vedle sebe se
         # na úzkém panelu ořezávaly, protože se nevešly do dostupné šířky.
@@ -323,6 +388,17 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.combo_bias_method = QComboBox()
         self.combo_bias_method.addItems(["medián (odolný)", "průměr"])
         form.addRow("Metoda biasu:", self.combo_bias_method)
+
+        self.combo_mono = QComboBox()
+        for _key, label in MONO_CHOICES:
+            self.combo_mono.addItem(label)
+        self.combo_mono.setToolTip(
+            "Týká se jen barevných snímků – mono snímky se použijí tak, jak jsou.\n"
+            "Vážený jas odpovídá tomu, jak černobílý obraz počítá sama kamera,\n"
+            "takže sedí na referenci. Průměr a maximum kanálů jsou citlivější\n"
+            "na modré rozptylové halo částic, ale zvyšují i šum pozadí."
+        )
+        form.addRow("Barevný snímek jako:", self.combo_mono)
 
         mode_row = QWidget()
         mode_layout = QHBoxLayout(mode_row)
@@ -544,6 +620,11 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.spin_scale.setValue(s.value("um_per_px", 1.0, type=float))
         self.spin_workers.setValue(s.value("workers", 0, type=int))
         self.chk_exclude_bias.setChecked(s.value("exclude_bias", True, type=bool))
+        self.combo_reference.setCurrentIndex(s.value("reference_mode", 0, type=int))
+        self.chk_match_level.setChecked(s.value("match_reference_level", True, type=bool))
+        self.combo_mono.setCurrentIndex(s.value("mono_mode", 0, type=int))
+        stored_dir = s.value("reference_dir", "", type=str)
+        self.reference_dir_override = stored_dir if stored_dir and os.path.isdir(stored_dir) else None
         self.chk_roi.setChecked(s.value("roi_enabled", False, type=bool))
         for index, box in enumerate(self.spin_roi):
             box.setValue(s.value(f"roi_{index}", 0, type=int))
@@ -566,6 +647,10 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         s.setValue("um_per_px", self.spin_scale.value())
         s.setValue("workers", self.spin_workers.value())
         s.setValue("exclude_bias", self.chk_exclude_bias.isChecked())
+        s.setValue("reference_mode", self.combo_reference.currentIndex())
+        s.setValue("match_reference_level", self.chk_match_level.isChecked())
+        s.setValue("mono_mode", self.combo_mono.currentIndex())
+        s.setValue("reference_dir", self.reference_dir_override or "")
         s.setValue("roi_enabled", self.chk_roi.isChecked())
         for index, box in enumerate(self.spin_roi):
             s.setValue(f"roi_{index}", box.value())
@@ -586,6 +671,10 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.spin_fiber_len.setValue(defaults.fiber_min_length_px)
         self.spin_scale.setValue(defaults.um_per_px)
         self.spin_workers.setValue(defaults.workers)
+        self.combo_reference.setCurrentIndex(0)
+        self.chk_match_level.setChecked(defaults.match_reference_level)
+        self.combo_mono.setCurrentIndex(0)
+        self.reference_dir_override = None
         self.chk_roi.setChecked(False)
         for box in self.spin_roi:
             box.setValue(0)
@@ -618,6 +707,10 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             roi=self.get_roi(),
             workers=self.spin_workers.value(),
             exclude_bias_from_series=self.chk_exclude_bias.isChecked(),
+            reference_mode=REFERENCE_MODES[self.combo_reference.currentIndex()],
+            reference_dir=self.reference_dir_override,
+            match_reference_level=self.chk_match_level.isChecked(),
+            mono_mode=MONO_CHOICES[self.combo_mono.currentIndex()][0],
         )
 
     # -- složky -------------------------------------------------------------
@@ -677,6 +770,76 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         if item:
             self.selected_folder_path = item.data(Qt.ItemDataRole.UserRole)
             self.lbl_status.setText(f"Vybráno: {os.path.basename(self.selected_folder_path)}")
+        self.update_reference_preview()
+
+    # -- reference ----------------------------------------------------------
+
+    def browse_reference_dir(self) -> None:
+        start = self.reference_dir_override or self.current_base_dir
+        folder = QFileDialog.getExistingDirectory(self, "Vyberte složku s referencemi (.npz)", start)
+        if folder:
+            self.reference_dir_override = folder
+            self.save_settings()
+            self.update_reference_preview()
+
+    def clear_reference_dir(self) -> None:
+        """Zruší ruční volbu složky – reference se zase bude hledat automaticky."""
+        self.reference_dir_override = None
+        self.save_settings()
+        self.update_reference_preview()
+
+    def update_reference_preview(self) -> None:
+        """Ukáže, která reference by se pro vybranou složku právě použila.
+
+        Je to jen náhled – závazný výběr provádí analýza znovu, protože se
+        složka s referencemi mezitím mohla změnit.
+        """
+        if not hasattr(self, "lbl_reference_pick"):
+            return
+
+        override = self.reference_dir_override
+        self.lbl_reference_dir.setText(
+            os.path.basename(os.path.normpath(override)) if override else "(hledá se automaticky)"
+        )
+        self.lbl_reference_dir.setToolTip(override or "Složka „reference“ se hledá vedle měření.")
+
+        mode = REFERENCE_MODES[self.combo_reference.currentIndex()]
+        enabled = mode != "serie"
+        self.chk_match_level.setEnabled(enabled)
+        if not enabled:
+            self.lbl_reference_pick.setText(
+                f"Pozadí se spočítá z prvních {self.spin_bias_frames.value()} snímků série."
+            )
+            return
+
+        folder = self.selected_folder_path
+        if not folder or not os.path.isdir(folder):
+            self.lbl_reference_pick.setText("Vyberte složku s měřením.")
+            return
+
+        paths = list_image_files(folder)
+        if not paths:
+            self.lbl_reference_pick.setText("Ve složce nejsou žádné snímky.")
+            return
+
+        try:
+            params = self.get_current_params()
+            choice, directory = resolve_reference(paths, params, folder=folder)
+        except Exception as exc:  # noqa: BLE001 – náhled nesmí shodit okno
+            self.lbl_reference_pick.setText(f"Referenci nelze načíst: {exc}")
+            return
+
+        if directory:
+            self.lbl_reference_dir.setText(os.path.basename(os.path.normpath(directory)))
+            self.lbl_reference_dir.setToolTip(directory)
+
+        if choice is None:
+            fallback = "Použije se bias ze série." if mode == "auto" else "Analýza skončí chybou."
+            self.lbl_reference_pick.setText(f"Složka s referencemi nenalezena. {fallback}")
+        elif not choice.ok:
+            self.lbl_reference_pick.setText(choice.reason)
+        else:
+            self.lbl_reference_pick.setText(choice.reason)
 
     # -- analýza ------------------------------------------------------------
 
@@ -936,9 +1099,24 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             return
         phases = "".join(f"<li>{name}: <b>{count}</b> snímků</li>" for name, count in data["faze"].items())
         warnings = "".join(f"<li>{item}</li>" for item in data["varovani"]) or "<li>žádná</li>"
+        notes = "".join(f"<li>{item}</li>" for item in data.get("poznamky", []))
+
+        bias = self.current_result.bias
+        if bias is None:
+            background = "neznámé"
+        elif bias.is_external:
+            offset = bias.level_offset_adu
+            background = (
+                f"reference <b>{os.path.basename(bias.reference_path or '')}</b> "
+                f"({bias.reference_label}), srovnání úrovně {offset:+.2f} ADU"
+            )
+        else:
+            background = f"prvních {bias.frames_used} snímků série ({self.current_result.params.bias_method})"
+
         html = f"""
         <h2 style='color:#1B4F72;'>Souhrn měření</h2>
         <table cellpadding='6' style='border-collapse:collapse;'>
+          <tr><td><b>Referenční pozadí</b></td><td>{background}</td></tr>
           <tr><td><b>Snímků</b></td><td>{data['pocet_snimku']}</td></tr>
           <tr><td><b>Délka měření</b></td><td>{data['delka_mereni_s']:.2f} s</td></tr>
           <tr><td><b>Průměrné pokrytí</b></td><td>{data['pokryti_prumer_pct']:.3f} %</td></tr>
@@ -955,6 +1133,7 @@ class DarkfieldAnalyzerGUI(QMainWindow):
           <tr><td><b>Doba výpočtu</b></td><td>{data['cas_analyzy_s']:.2f} s</td></tr>
         </table>
         <h3>Zastoupení fází</h3><ul>{phases}</ul>
+        {"<h3>Poznámky k průběhu</h3><ul>" + notes + "</ul>" if notes else ""}
         <h3>Upozornění</h3><ul>{warnings}</ul>
         """
         self.summary_browser.setHtml(html)

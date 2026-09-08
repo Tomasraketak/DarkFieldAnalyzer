@@ -1,9 +1,10 @@
 # Dark-Field Contamination Analyzer
 
 Automatické vyhodnocení časových řad snímků z **mikroskopie v temném poli**
-(dark-field) pořízených černobílou kamerou. Aplikace měří, kolik kontaminace
+(dark-field), černobílých i barevných. Aplikace měří, kolik kontaminace
 (prach, vlákna, kapky, kondenzát) přibylo na witness sklíčku, jak rychle a v
-jakých fázích.
+jakých fázích. Referenční pozadí umí převzít z reference uložené programem
+BMS Cam Control (`reference/*.npz`).
 
 Cíl: Windows 11, Dell Vostro 7500 (Intel Core i7, 16 GB RAM), Python 3.10+.
 
@@ -105,6 +106,56 @@ Další opravené problémy:
   (Savitzky–Golay 1. řádu) místo rozdílu sousedních snímků, který u rychlých
   sérií jen zesiloval šum. Prahy pro fáze se odvozují z dynamiky měření.
 
+### Referenční pozadí ze složky `reference`
+
+Záznamový program **BMS Cam Control** ukládá referenci mimo složku s měřením –
+do společné složky `…\BMS fotky\reference` – jako dvojici souborů:
+
+| Soubor | Obsah |
+|--------|-------|
+| `reference_20260908_142910.npz` | `mean_mono` = průměr N tmavých snímků (float32), `frames_mono`, `created_mono` |
+| `reference_20260908_142910.json` | nastavení kamery, osvětlení a prahů; jen popis, analýza z něj nic nepřebírá |
+
+- **Automatické hledání složky.** Podsložka `reference` se hledá nejdřív přímo
+  u měření, pak v nadřazených složkách. Prázdná složka `reference` hledání
+  nezastaví. V GUI ji lze určit i ručně.
+- **Vybere se poslední reference pořízená *před* začátkem měření.** Pozdější
+  nikdy nevyhraje, ani když je časově blíž – popisovala by pozadí, které v době
+  měření ještě neplatilo. Existují-li jen pozdější, použije se nejbližší z nich
+  a analýza to hlásí jako upozornění. Odstup nad 6 hodin se také hlásí.
+- **Čas se čte z názvu souboru**, takže výběr nemusí rozbalovat obrazová data –
+  ve složce s desítkami referencí by to trvalo déle než celá analýza.
+- **Žádný snímek série se nespotřebuje na bias.** Vyhodnotí se všechny snímky ve
+  složce, ne až od (N+1)-ního.
+- **Srovnání úrovně.** Reference vznikla dřív, takže se od snímků může lišit
+  konstantním posunem jasu (teplota senzoru, jas zdroje světla). Bez srovnání by
+  se takový posun projevil jako plošné zamlžení přes celý snímek. Posun se
+  odhaduje **jednou pro celou sérii** jako nejnižší naměřená úroveň pozadí –
+  v temném poli kontaminace jas jen přidává, takže nejtmavší snímek je nejlepší
+  odhad skutečné nuly. Kdyby se počítal pro každý snímek zvlášť, odečetlo by se
+  i skutečné zamlžení, které má analýza naopak měřit. Posun pod 0,5 ADU se
+  ignoruje; naměřená hodnota je v souhrnu i v exportovaném JSON.
+- **Režimy** (GUI i `--reference`): `auto` (reference, jinak bias ze série),
+  `reference` (bez reference skončí chybou), `serie` (referenci ignoruje).
+
+Ověřeno na skutečné referenci ze 4K kamery: při referenci posunuté o −6 ADU
+hlásila analýza bez srovnání 100 % zamlžení na čistém sklíčku, se srovnáním
+0 % – stejně jako s referencí, která sedí.
+
+### Barevné i černobílé snímky
+
+Barevný snímek se převede na intenzitu jedním z režimů (`--mono`, v GUI
+*Barevný snímek jako*):
+
+| Režim | Kdy použít |
+|-------|-----------|
+| `luma` (výchozí) | vážený jas Rec.601 – stejný převod, jakým počítá mono kanál sama kamera, takže sedí na referenci `mean_mono` |
+| `prumer` | nepodceňuje modrou; modravé rozptylové halo částic má plnou váhu |
+| `maximum` | nejcitlivější na částice svítící jen v jednom kanálu, ale zvyšuje šum pozadí |
+| `r` / `g` / `b` | cílené měření jednoho kanálu |
+
+Mono snímky projdou beze změny. Snímky s alfa kanálem se převedou na BGR.
+
 ### Provoz
 
 - **Paralelní zpracování** s ohledem na paměť: počet vláken se automaticky sníží,
@@ -147,12 +198,17 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
    (naposledy zvolená se pamatuje).
    V seznamu se objeví všechny podsložky se snímky **i samotná zvolená složka**,
    pokud snímky obsahuje přímo (dřív se nezobrazila a vypadalo to, že tam nic není).
-2. **Parametry analýzy** – rozlišení/binning, počet a metoda bias snímků, režim a
-   hodnota prahu, práh zamlžení, hranice hotspotu, minimální plocha částice,
-   hranice velkého shluku, protáhlost a délka vlákna, kalibrace µm/px, počet
-   vláken CPU, ROI. Každé pole má nápovědu po najetí myší. Panel je v jednom
-   sloupci a roluje se, takže se vejde i na nízký displej.
-3. **Spuštění a export** – průběh, zastavení, export CSV + grafy + JSON.
+2. **Referenční pozadí (bias)** – režim (automaticky / vždy ze složky / vždy ze
+   série), volba složky s referencemi, zaškrtávátko *Srovnat úroveň reference se
+   snímky* a modrý řádek s tím, **která reference se právě použije** a jak dlouho
+   před měřením vznikla. Náhled se obnovuje hned po výběru složky.
+3. **Parametry analýzy** – rozlišení/binning, počet a metoda bias snímků, převod
+   barevného snímku na intenzitu, režim a hodnota prahu, práh zamlžení, hranice
+   hotspotu, minimální plocha částice, hranice velkého shluku, protáhlost a délka
+   vlákna, kalibrace µm/px, počet vláken CPU, ROI. Každé pole má nápovědu po
+   najetí myší. Panel je v jednom sloupci a roluje se, takže se vejde i na nízký
+   displej.
+4. **Spuštění a export** – průběh, zastavení, export CSV + grafy + JSON.
 
 **Pravý panel**
 
@@ -167,7 +223,11 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
   uložení náhledu do PNG.
   Barvy: <span>azurová = zamlžení, žlutá = mikročástice, červená = shluky,
   zelená = vlákna, fialová = hotspoty, žlutý kříž = těžiště kontaminace</span>.
-- 📋 Datová tabulka · 🧾 Souhrn měření · 📖 Průvodce s popisem všech veličin
+- 📋 Datová tabulka · 📖 Průvodce s popisem všech veličin
+- 🧾 **Souhrn měření** – první řádek uvádí, odkud pochází referenční pozadí
+  (soubor reference a naměřený posun úrovně, nebo počet bias snímků ze série).
+  Informativní poznámky k průběhu jsou oddělené od skutečných upozornění, takže
+  běžný běh už nevyskakuje dialog.
 
 ---
 
@@ -182,6 +242,9 @@ py main.py --folder "C:\...\BMS fotky" --batch
 
 # jen výřez, absolutní práh, bez výpisu průběhu
 py main.py --folder "C:\...\mereni" --roi 200,100,1500,900 --mode absolute --absolute 10 --quiet
+
+# vynutit referenci ze složky a barevné snímky měřit průměrem kanálů
+py main.py --folder "C:\...\mereni" --reference reference --mono prumer
 ```
 
 Nejdůležitější přepínače (`py main.py --help` vypíše všechny):
@@ -198,6 +261,10 @@ Nejdůležitější přepínače (`py main.py --help` vypíše všechny):
 | `--roi` | výřez `x,y,šířka,výška` | celý snímek |
 | `--workers` | počet vláken (0 = auto) | 0 |
 | `--include-bias` | ponechat bias snímky ve výsledné řadě | vypnuto |
+| `--reference` | zdroj pozadí: `auto` / `reference` / `serie` | `auto` |
+| `--reference-dir` | složka s `.npz` referencemi | hledá se `reference` |
+| `--no-level-match` | nesrovnávat úroveň externí reference | srovnává se |
+| `--mono` | převod barvy: `luma`/`prumer`/`maximum`/`r`/`g`/`b` | `luma` |
 
 ---
 
@@ -236,7 +303,8 @@ lze zobrazit – v CSV jsou označené ve sloupci *Bias snímek*.
 
 ```
 analyzer.py              analytické jádro (bez závislosti na GUI)
-frameio.py               načítání snímků, Unicode cesty, časová razítka
+frameio.py               načítání snímků, Unicode cesty, časová razítka, převod barvy
+reference.py             hledání, výběr a načtení reference z .npz + .json
 exporter.py              CSV, souhrnné grafy, JSON souhrn
 gui.py                   grafické rozhraní (PyQt6)
 viewer.py                prohlížeč snímků s klasifikační maskou
@@ -253,5 +321,6 @@ py -m pip install pytest
 py -m pytest -q
 ```
 
-37 testů pokrývá jádro, export i grafické rozhraní (běží bez obrazovky přes
-`QT_QPA_PLATFORM=offscreen`), včetně regresí na všechny tři výše popsané pády.
+88 testů pokrývá jádro, výběr reference, barevné snímky, export i grafické
+rozhraní (běží bez obrazovky přes `QT_QPA_PLATFORM=offscreen`), včetně regresí
+na všechny tři výše popsané pády.

@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analyzer import AnalysisParams, analyze_series  # noqa: E402
 from exporter import CSV_COLUMNS, export_all, export_to_csv, summarize  # noqa: E402
+from frameio import list_image_files  # noqa: E402
 from tests.test_analyzer import make_frame, write_series  # noqa: E402
 
 
@@ -142,6 +144,8 @@ def test_gui_runs_full_analysis(app, tmp_path_factory):
     window.combo_res.setCurrentIndex(1)           # plné rozlišení
     window.spin_bias_frames.setValue(2)
     window.chk_exclude_bias.setChecked(True)      # nezávisle na uloženém nastavení
+    window.combo_reference.setCurrentIndex(2)     # bias ze série (složka nemá reference)
+    window.reference_dir_override = None
     window.start_analysis()
 
     deadline = time.time() + 120
@@ -363,3 +367,133 @@ def test_left_panel_is_scrollable(app):
     assert left.widgetResizable()
     assert left.maximumWidth() <= 520
     window.close()
+
+
+# ---------------------------------------------------------------------------
+# Referenční pozadí v GUI
+# ---------------------------------------------------------------------------
+
+def _reference_workspace(root):
+    """Vytvoří strukturu „BMS fotky“ s referencemi a jednou sérií."""
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_reference import background, write_reference, write_series
+
+    ref_dir = os.path.join(root, "reference")
+    base = background()
+    write_reference(ref_dir, datetime(2026, 9, 8, 9, 0, 0), base * 0.5)
+    write_reference(ref_dir, datetime(2026, 9, 8, 14, 29, 10), base)
+    folder = os.path.join(root, "mereni")
+    write_series(folder, base)
+    return folder
+
+
+def test_gui_previews_the_chosen_reference(app, tmp_path):
+    """Po výběru složky musí panel ukázat, která reference se použije."""
+    from PyQt6.QtCore import Qt
+
+    import gui as gui_module
+
+    root = str(tmp_path / "BMS fotky")
+    folder = _reference_workspace(root)
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    window.reference_dir_override = None
+    window.combo_reference.setCurrentIndex(0)          # automaticky
+    window.current_base_dir = root
+    window.refresh_folder_list()
+    for row in range(window.folder_table.rowCount()):
+        path = window.folder_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        if os.path.basename(str(path)) == "mereni":
+            window.folder_table.selectRow(row)
+            break
+
+    text = window.lbl_reference_pick.text()
+    assert "reference_20260908_142910.npz" in text
+    assert "14:29:10" in text
+
+    window.combo_reference.setCurrentIndex(2)          # vždy ze série
+    assert "prvních" in window.lbl_reference_pick.text()
+    assert not window.chk_match_level.isEnabled()
+    window.close()
+
+
+def test_gui_analysis_uses_the_reference_and_keeps_all_frames(app, tmp_path):
+    """Celý řetězec v GUI: s referencí se nespotřebují snímky série na bias."""
+    import time
+
+    from PyQt6.QtCore import Qt
+
+    import gui as gui_module
+
+    root = str(tmp_path / "BMS fotky")
+    folder = _reference_workspace(root)
+    expected = len(list_image_files(folder))
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    window.reference_dir_override = None
+    window.combo_reference.setCurrentIndex(0)
+    window.chk_match_level.setChecked(True)
+    window.combo_mono.setCurrentIndex(0)
+    window.combo_res.setCurrentIndex(1)                # plné rozlišení
+    window.current_base_dir = root
+    window.refresh_folder_list()
+    for row in range(window.folder_table.rowCount()):
+        path = window.folder_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        if os.path.basename(str(path)) == "mereni":
+            window.folder_table.selectRow(row)
+            break
+
+    window.start_analysis()
+    deadline = time.time() + 120
+    while window.worker and window.worker.isRunning() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    for _ in range(10):
+        app.processEvents()
+
+    assert window.current_result is not None
+    assert window.current_result.bias.is_external
+    assert len(window.current_result.metrics) == expected      # nic neubylo
+    assert window.table_results.rowCount() == expected
+    assert "reference_20260908_142910.npz" in window.summary_browser.toPlainText()
+    window.close()
+
+
+def test_gui_params_carry_reference_and_color_settings(app, tmp_path):
+    import gui as gui_module
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    window.combo_reference.setCurrentIndex(1)
+    window.combo_mono.setCurrentIndex(2)
+    window.chk_match_level.setChecked(False)
+    window.reference_dir_override = str(tmp_path)
+
+    params = window.get_current_params()
+    assert params.reference_mode == "reference"
+    assert params.mono_mode == "maximum"
+    assert params.match_reference_level is False
+    assert params.reference_dir == str(tmp_path)
+    assert params.mono_label == "maximum kanálů"
+
+    # Nastavení se ukládá do QSettings a přežilo by do dalších testů i spuštění.
+    window.combo_reference.setCurrentIndex(0)
+    window.chk_match_level.setChecked(True)
+    window.combo_mono.setCurrentIndex(0)
+    window.reference_dir_override = None
+    window.close()
+
+
+def test_help_text_has_no_stray_escape_sequences():
+    """Windows cesty v nápovědě se musí escapovat, jinak z nich zmizí znaky.
+
+    Regrese: ``<code>…\\BMS fotky\\reference</code>`` v běžném (ne raw) řetězci
+    Pythonu udělá z ``\\r`` návrat vozíku – v nápovědě se pak zobrazilo
+    „BMS fotky eference“.
+    """
+    from help_text import HELP_HTML
+
+    stray = {ch for ch in HELP_HTML if ord(ch) < 32 and ch != "\n"}
+    assert not stray, f"nápověda obsahuje řídicí znaky: {[hex(ord(c)) for c in stray]}"
+    assert "\\BMS fotky\\reference" in HELP_HTML

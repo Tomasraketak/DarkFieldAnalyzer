@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple
 from analyzer import AnalysisParams, analyze_series
 from exporter import export_all, summarize
 from frameio import list_image_files, list_measurement_folders
+from reference import ReferenceError
 
 
 def _configure_console() -> None:
@@ -66,6 +67,10 @@ def build_params(args: argparse.Namespace) -> AnalysisParams:
         roi=parse_roi(args.roi),
         workers=args.workers,
         exclude_bias_from_series=not args.include_bias,
+        reference_mode=args.reference,
+        reference_dir=args.reference_dir,
+        match_reference_level=not args.no_level_match,
+        mono_mode=args.mono,
     )
 
 
@@ -79,7 +84,7 @@ def run_folder(folder: str, args: argparse.Namespace) -> int:
     params = build_params(args)
     print(f"\nSložka: {folder}")
     print(f"Snímků: {len(image_paths)}   |   bias: {params.bias_frames} ({params.bias_method})"
-          f"   |   binning: {params.resolution_label}")
+          f"   |   binning: {params.resolution_label}   |   barva: {params.mono_label}")
 
     total = len(image_paths)
     step = max(1, total // 20)
@@ -90,8 +95,17 @@ def run_folder(folder: str, args: argparse.Namespace) -> int:
                   f"pokrytí {metrics.total_coverage_pct:7.3f} %  čistota {metrics.cleanliness_score:5.1f}",
                   flush=True)
 
-    result = analyze_series(image_paths, params, progress=None if args.quiet else progress)
+    try:
+        result = analyze_series(image_paths, params, progress=None if args.quiet else progress)
+    except ReferenceError as exc:
+        # Režim --reference reference: bez použitelné reference se raději nic
+        # nespočítá, aby výsledek nevznikl proti jinému pozadí, než uživatel čeká.
+        print(f"Chyba: {exc}")
+        print("       Použijte --reference auto (bias ze série) nebo --reference-dir.")
+        return 1
 
+    for note in result.notes:
+        print(f"  · {note}")
     for warning in result.warnings:
         print(f"  ! {warning}")
     for path, reason in result.failed_files[:10]:
@@ -103,6 +117,10 @@ def run_folder(folder: str, args: argparse.Namespace) -> int:
 
     per_frame = result.elapsed_s / len(result.metrics) * 1000.0
     print(f"Hotovo za {result.elapsed_s:.2f} s ({per_frame:.1f} ms/snímek).")
+    if result.bias is not None:
+        print(f"  Pozadí: {result.bias.origin_label}"
+              + (f"   |   srovnání úrovně {result.bias.level_offset_adu:+.2f} ADU"
+                 if result.bias.is_external else ""))
 
     summary = summarize(result)
     print(f"  Průměrné pokrytí: {summary['pokryti_prumer_pct']:.3f} %"
@@ -166,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=0, help="Počet vláken (0 = auto)")
     parser.add_argument("--include-bias", action="store_true",
                         help="Ponechat bias snímky ve výsledné řadě (ve výchozím stavu se vynechávají)")
+    parser.add_argument("--reference", choices=["auto", "reference", "serie"], default="auto",
+                        help="Zdroj pozadí: auto = reference ze složky, jinak série")
+    parser.add_argument("--reference-dir",
+                        help="Složka s .npz referencemi (jinak se hledá podsložka „reference“)")
+    parser.add_argument("--no-level-match", action="store_true",
+                        help="Nesrovnávat úroveň externí reference se snímky")
+    parser.add_argument("--mono", choices=["luma", "prumer", "maximum", "r", "g", "b"], default="luma",
+                        help="Převod barevného snímku na intenzitu")
     parser.add_argument("--roi", help="Výřez k analýze ve tvaru x,y,sirka,vyska (px plného rozlišení)")
     parser.add_argument("--export", help="Cesta k výstupnímu CSV")
     parser.add_argument("--quiet", action="store_true", help="Nevypisovat průběh")

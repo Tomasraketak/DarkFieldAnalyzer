@@ -262,7 +262,9 @@ class ImageViewerWidget(QWidget):
         self.lbl_frame_info.setText(f"{index + 1} / {len(self.image_paths)}")
 
         try:
-            frame = load_frame(path, full_scale=self.bias.full_scale)
+            frame = load_frame(
+                path, full_scale=self.bias.full_scale, mono_mode=self.params.mono_mode
+            )
             binning = self.bias.binning * (2 if self.chk_fast.isChecked() else 1)
             image = apply_geometry(frame.data, binning, self.params.roi)
 
@@ -281,6 +283,7 @@ class ImageViewerWidget(QWidget):
                 t0=t0,
                 binning=binning,
                 generate_masks=True,
+                level_offset=self.bias.level_offset_adu,
             )
             rgb = self._compose_view(image, masks, metrics)
         except Exception as exc:  # noqa: BLE001 – slot nesmí propustit výjimku

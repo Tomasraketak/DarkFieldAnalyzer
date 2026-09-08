@@ -121,6 +121,7 @@ def export_to_csv(
         if params:
             writer.writerow(["# Počet snímků biasu", params.bias_frames])
             writer.writerow(["# Metoda biasu", params.bias_method])
+            writer.writerow(["# Převod barvy na intenzitu", params.mono_label])
             writer.writerow(["# Binning", params.resolution_label])
             writer.writerow(["# Režim prahu", params.threshold_mode])
             writer.writerow(["# Sigma násobek šumu", _fmt(params.sigma, "{:.2f}", decimal_comma)])
@@ -192,8 +193,29 @@ def summarize(result: SeriesResult) -> Dict[str, object]:
         "cas_analyzy_s": round(result.elapsed_s, 2),
         "nactene_chyby": len(result.failed_files),
         "varovani": list(result.warnings),
+        "poznamky": list(result.notes),
         "synteticka_casova_osa": result.synthetic_time_axis,
+        "pozadi": _background_summary(result),
     }
+
+
+def _background_summary(result: SeriesResult) -> Dict[str, object]:
+    """Odkud pochází referenční pozadí (bias) a jak dobře sedí na snímky."""
+    bias = result.bias
+    if bias is None:
+        return {}
+    info: Dict[str, object] = {
+        "zdroj": "reference" if bias.is_external else "prvni_snimky_serie",
+        "pouzito_snimku": bias.frames_used,
+    }
+    if bias.is_external:
+        info["soubor"] = os.path.basename(bias.reference_path or "")
+        info["porizeno"] = bias.reference_created.isoformat() if bias.reference_created else ""
+        info["popis"] = bias.reference_label
+        info["srovnani_urovne_adu"] = round(float(bias.level_offset_adu), 3)
+        if result.reference_note:
+            info["poznamka"] = result.reference_note
+    return info
 
 
 def export_summary_json(result: SeriesResult, output_path: str, folder_name: str = "") -> str:

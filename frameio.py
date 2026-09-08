@@ -40,6 +40,26 @@ OUTPUT_NAME_MARKERS: Tuple[str, ...] = (
 #: Referenční rozsah, na který se všechny snímky normalizují (8bitová škála ADU).
 DISPLAY_FULL_SCALE = 255.0
 
+#: Jak se barevný snímek převede na jednokanálovou intenzitu.
+#:
+#: Kamera v BMS Cam Control umí ukládat mono i barevně a referenční pozadí
+#: (``mean_mono`` v .npz) je vždy jednokanálové. Aby odečet reference dával
+#: smysl, musí se barevný snímek promítnout do intenzity stejným způsobem,
+#: jakým vznikl mono kanál v záznamové aplikaci – proto je volba nastavitelná.
+#:
+#: * ``luma``    – vážený jas Rec.601 (0,299 R + 0,587 G + 0,114 B). Standardní
+#:                 „černobílý“ převod, který používá i sama kamera.
+#: * ``prumer``  – prostý průměr kanálů. Nepodceňuje modrou, takže modravé
+#:                 rozptylové halo částic v temném poli má plnou váhu.
+#: * ``maximum`` – maximum kanálů. Nejcitlivější na částice, které svítí jen
+#:                 v jednom kanálu, ale zvyšuje i šum pozadí (√3× u nekorelovaného šumu).
+#: * ``r`` / ``g`` / ``b`` – jediný kanál.
+MONO_MODES: Tuple[str, ...] = ("luma", "prumer", "maximum", "r", "g", "b")
+DEFAULT_MONO_MODE = "luma"
+
+#: Váhy Rec.601 v pořadí kanálů OpenCV (B, G, R).
+_LUMA_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+
 
 class FrameReadError(RuntimeError):
     """Snímek se nepodařilo načíst nebo dekódovat."""
@@ -53,10 +73,16 @@ class FrameShapeError(FrameReadError):
 class FrameData:
     """Načtený snímek převedený na jednotnou škálu 0–255 ADU."""
 
-    data: np.ndarray          # float32, rozsah 0–255 ADU
+    data: np.ndarray          # float32, rozsah 0–255 ADU (vždy jednokanálový)
     native_dtype: str         # "uint8" / "uint16" / ...
     native_full_scale: float  # plný rozsah v původních jednotkách (255, 4095, 65535, ...)
     path: str
+    source_channels: int = 1  # 1 = mono soubor, 3 = barevný soubor
+    mono_mode: str = DEFAULT_MONO_MODE  # jak se barva převedla na intenzitu
+
+    @property
+    def is_color(self) -> bool:
+        return self.source_channels >= 3
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -111,7 +137,67 @@ def _guess_full_scale(image: np.ndarray) -> float:
     return peak
 
 
-def load_frame(path: str, full_scale: Optional[float] = None) -> FrameData:
+def normalize_mono_mode(mode: Optional[str]) -> str:
+    """Ošetří uživatelský vstup názvu převodu barvy na intenzitu."""
+    text = (mode or DEFAULT_MONO_MODE).strip().lower()
+    aliases = {
+        "": DEFAULT_MONO_MODE,
+        "auto": DEFAULT_MONO_MODE,
+        "jas": "luma",
+        "gray": "luma",
+        "grey": "luma",
+        "mean": "prumer",
+        "průměr": "prumer",
+        "avg": "prumer",
+        "max": "maximum",
+        "red": "r",
+        "green": "g",
+        "blue": "b",
+        "červená": "r",
+        "zelená": "g",
+        "modrá": "b",
+    }
+    text = aliases.get(text, text)
+    return text if text in MONO_MODES else DEFAULT_MONO_MODE
+
+
+def to_mono(image: np.ndarray, mono_mode: str = DEFAULT_MONO_MODE) -> np.ndarray:
+    """Převede barevný (BGR) snímek na jednokanálovou intenzitu.
+
+    Mono snímek vrátí beze změny. Výsledek má vždy stejný datový typ jako
+    vstup u celočíselných dat by zaokrouhlení posunulo úroveň pozadí, proto
+    se počítá ve float32 a na původní typ se **nevrací** – volající pracuje
+    dál ve float.
+    """
+    if image.ndim == 2:
+        return image
+    if image.ndim != 3:
+        raise FrameReadError(f"Nepodporovaný tvar snímku {image.shape}")
+
+    if image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    if image.shape[2] == 1:
+        return image[:, :, 0]
+    if image.shape[2] != 3:
+        raise FrameReadError(f"Nepodporovaný počet kanálů: {image.shape[2]}")
+
+    mode = normalize_mono_mode(mono_mode)
+    if mode in ("b", "g", "r"):
+        return image[:, :, {"b": 0, "g": 1, "r": 2}[mode]]
+
+    planes = image.astype(np.float32, copy=False)
+    if mode == "maximum":
+        return planes.max(axis=2)
+    if mode == "prumer":
+        return planes.mean(axis=2, dtype=np.float32)
+    return planes @ _LUMA_WEIGHTS          # luma (Rec.601, pořadí B, G, R)
+
+
+def load_frame(
+    path: str,
+    full_scale: Optional[float] = None,
+    mono_mode: str = DEFAULT_MONO_MODE,
+) -> FrameData:
     """Načte snímek jako float32 v jednotné škále 0–255 ADU.
 
     Args:
@@ -120,6 +206,8 @@ def load_frame(path: str, full_scale: Optional[float] = None) -> FrameData:
             Pokud je ``None``, odhadne se automaticky. Při analýze série se
             předává hodnota zjištěná z bias snímků, aby byla škála všech
             snímků v sérii identická.
+        mono_mode: převod barevného snímku na intenzitu (viz :data:`MONO_MODES`).
+            Mono snímků se netýká.
 
     Raises:
         FrameReadError: pokud soubor nelze načíst nebo dekódovat.
@@ -128,22 +216,27 @@ def load_frame(path: str, full_scale: Optional[float] = None) -> FrameData:
     if image is None:
         raise FrameReadError(f"Snímek nelze načíst nebo dekódovat: {path}")
 
-    if image.ndim == 3:
-        if image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    elif image.ndim != 2:
+    channels = 1 if image.ndim == 2 else (image.shape[2] if image.ndim == 3 else 0)
+    if image.ndim not in (2, 3):
         raise FrameReadError(f"Nepodporovaný tvar snímku {image.shape}: {path}")
 
     native_dtype = str(image.dtype)
     scale = float(full_scale) if full_scale else _guess_full_scale(image)
     scale = max(scale, 1.0)
 
-    data = image.astype(np.float32, copy=False)
+    mode = normalize_mono_mode(mono_mode)
+    data = np.asarray(to_mono(image, mode), dtype=np.float32)
     if abs(scale - DISPLAY_FULL_SCALE) > 1e-6:
         data = data * np.float32(DISPLAY_FULL_SCALE / scale)
 
-    return FrameData(data=data, native_dtype=native_dtype, native_full_scale=scale, path=path)
+    return FrameData(
+        data=np.ascontiguousarray(data, dtype=np.float32),
+        native_dtype=native_dtype,
+        native_full_scale=scale,
+        path=path,
+        source_channels=int(channels),
+        mono_mode=mode,
+    )
 
 
 def probe_full_scale(paths: Sequence[str], sample: int = 3) -> float:

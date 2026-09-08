@@ -44,12 +44,25 @@ import cv2
 import numpy as np
 
 from frameio import (
+    DEFAULT_MONO_MODE,
     FrameReadError,
     FrameShapeError,
     build_time_axis,
     load_frame,
+    normalize_mono_mode,
     parse_timestamp_from_filename,
     probe_full_scale,
+)
+from reference import (
+    ReferenceChoice,
+    ReferenceError,
+    ReferenceRecord,
+    find_reference_dir,
+    list_references,
+    load_reference,
+    scale_to_adu,
+    select_reference,
+    series_start_time,
 )
 
 #: Nad tento počet kontaminovaných pixelů se přeskočí výpočet momentů
@@ -61,6 +74,21 @@ AUTO_BINNING_TARGET_HEIGHT = 1200
 
 #: Kolik souborů na začátku série se prohlédne, než se určí rozlišení měření.
 SHAPE_PROBE_COUNT = 8
+
+#: Percentil nízkofrekvenční složky, který se bere jako „úroveň pozadí“ při
+#: srovnávání externí reference se snímky. Nízký percentil je dominantně
+#: pozadí i tehdy, když je většina plochy kontaminovaná.
+REFERENCE_LEVEL_PERCENTILE = 10.0
+
+#: Nad tímto posunem úrovně (ADU) se do protokolu zapíše upozornění, že
+#: reference nesedí na snímky (jiná expozice, jiný převod barvy na mono).
+REFERENCE_LEVEL_WARN_ADU = 3.0
+
+#: Menší posun než tento se ignoruje – dobře sedící reference se nemá „opravovat“.
+REFERENCE_LEVEL_DEADBAND_ADU = 0.5
+
+#: Kolik snímků rovnoměrně rozložených po sérii se prohlédne při odhadu posunu.
+REFERENCE_LEVEL_SAMPLES = 6
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +118,14 @@ class AnalysisParams:
     assumed_fps: float = 1.0           # Náhradní osa, pokud snímky nemají čas
     exclude_bias_from_series: bool = True   # Bias snímky nemají vlastní referenci – viz README
 
+    # --- reference (bias) z externí složky --------------------------------
+    reference_mode: str = "auto"       # "auto" | "reference" | "serie"
+    reference_dir: Optional[str] = None    # None = hledat složku "reference" automaticky
+    match_reference_level: bool = True     # Srovnat úroveň externí reference se snímky
+
+    # --- barevné snímky ----------------------------------------------------
+    mono_mode: str = DEFAULT_MONO_MODE     # Převod barvy na intenzitu (viz frameio.MONO_MODES)
+
     def resolve_binning(self, image_height: int) -> int:
         """Vrátí skutečný binning – při ``binning=0`` ho odvodí z rozlišení."""
         if self.binning and self.binning > 0:
@@ -105,6 +141,17 @@ class AnalysisParams:
             int(self.binning), f"binning {self.binning}×{self.binning}"
         )
 
+    @property
+    def mono_label(self) -> str:
+        return {
+            "luma": "vážený jas (Rec.601)",
+            "prumer": "průměr kanálů",
+            "maximum": "maximum kanálů",
+            "r": "jen červený kanál",
+            "g": "jen zelený kanál",
+            "b": "jen modrý kanál",
+        }.get(normalize_mono_mode(self.mono_mode), self.mono_mode)
+
 
 @dataclass
 class BiasModel:
@@ -118,9 +165,27 @@ class BiasModel:
     frame_paths: List[str] = field(default_factory=list)     # soubory tvořící bias
     rejected_paths: List[Tuple[str, str]] = field(default_factory=list)  # (cesta, důvod)
 
+    # Externí reference ze složky "reference" (soubory .npz z BMS Cam Control)
+    origin: str = "serie"                     # "serie" | "reference"
+    reference_path: Optional[str] = None
+    reference_created: Optional[datetime] = None
+    reference_label: str = ""
+    level_offset_adu: float = 0.0             # konstantní posun úrovně reference
+
     @property
     def shape(self) -> Tuple[int, int]:
         return self.data.shape  # type: ignore[return-value]
+
+    @property
+    def is_external(self) -> bool:
+        """True, pokud pozadí nepochází ze snímků samotné série."""
+        return self.origin == "reference"
+
+    @property
+    def origin_label(self) -> str:
+        if self.is_external:
+            return f"reference {os.path.basename(self.reference_path or '')}"
+        return f"prvních {self.frames_used} snímků série"
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +256,10 @@ class FrameMetrics:
     is_bias_frame: bool = False
     note: str = ""
 
+    #: Posun úrovně, o který se srovnala externí reference se snímkem [ADU].
+    #: U biasu počítaného ze série je vždy 0.
+    reference_offset_adu: float = 0.0
+
     # Dopočítává se přes celou sérii
     rate_coverage_pct_per_s: float = 0.0
     rate_haze_pct_per_s: float = 0.0
@@ -209,8 +278,16 @@ class SeriesResult:
     elapsed_s: float = 0.0
     failed_files: List[Tuple[str, str]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    #: Informativní poznámky k průběhu (která reference se vzala, odkud pozadí).
+    #: Na rozdíl od ``warnings`` neznamenají problém a GUI je nevyskakuje v dialogu.
+    notes: List[str] = field(default_factory=list)
     synthetic_time_axis: bool = False
     cancelled: bool = False
+
+    #: Zvolená externí reference (``None`` = bias se počítal ze série).
+    reference: Optional[ReferenceRecord] = None
+    reference_dir: Optional[str] = None
+    reference_note: str = ""
 
     @property
     def frame_count(self) -> int:
@@ -257,6 +334,68 @@ def match_shape(reference: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Rozlišení série (pojistka proti cizím souborům ve složce)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SeriesProbe:
+    """Co se zjistilo z prvních souborů série."""
+
+    source_shape: Tuple[int, int]
+    frames: List[Tuple[str, np.ndarray]] = field(default_factory=list)   # jen shodné rozlišení
+    rejected: List[Tuple[str, str]] = field(default_factory=list)        # (cesta, důvod)
+
+
+def probe_series_shape(
+    image_paths: Sequence[str],
+    params: AnalysisParams,
+    full_scale: float,
+    probe_count: int = SHAPE_PROBE_COUNT,
+) -> SeriesProbe:
+    """Určí rozlišení série hlasováním z několika prvních souborů.
+
+    Rozlišení se **nebere z prvního souboru v pořadí**: kdyby se do složky
+    dostal cizí obrázek (typicky exportovaný graf, který se řadí abecedně před
+    ``df_00001_…``), stal by se jinak měřítkem pro celé měření – a při
+    interním biasu dokonce referenčním pozadím. Soubory s jiným rozlišením
+    se vrací v ``rejected`` a z analýzy se vyřazují.
+    """
+    candidates: List[Tuple[str, np.ndarray]] = []
+    rejected: List[Tuple[str, str]] = []
+    mono_mode = normalize_mono_mode(params.mono_mode)
+
+    for path in list(image_paths)[: max(1, probe_count)]:
+        try:
+            frame = load_frame(path, full_scale=full_scale, mono_mode=mono_mode)
+        except FrameReadError as exc:
+            rejected.append((path, str(exc)))
+            continue
+        candidates.append((path, frame.data))
+
+    if not candidates:
+        return SeriesProbe(source_shape=(0, 0), frames=[], rejected=rejected)
+
+    shape_counts: Dict[Tuple[int, int], int] = {}
+    for _path, data in candidates:
+        shape_counts[data.shape] = shape_counts.get(data.shape, 0) + 1
+    # Nejčastější rozlišení; při shodě vyhraje to, které se objevilo dřív.
+    source_shape = max(shape_counts, key=lambda shape: shape_counts[shape])
+
+    usable: List[Tuple[str, np.ndarray]] = []
+    for path, data in candidates:
+        if data.shape == source_shape:
+            usable.append((path, data))
+        else:
+            rejected.append((
+                path,
+                f"rozlišení {data.shape[1]}×{data.shape[0]} px neodpovídá sérii "
+                f"({source_shape[1]}×{source_shape[0]} px)",
+            ))
+
+    return SeriesProbe(source_shape=source_shape, frames=usable, rejected=rejected)
+
+
+# ---------------------------------------------------------------------------
 # Bias
 # ---------------------------------------------------------------------------
 
@@ -278,39 +417,14 @@ def compute_bias(
     if full_scale is None:
         full_scale = probe_full_scale(image_paths, sample=min(3, n))
 
-    # Rozlišení série se určí hlasováním z několika prvních souborů, ne podle
-    # prvního v pořadí. Kdyby se do složky dostal cizí obrázek (typicky
-    # exportovaný graf, který se řadí abecedně před snímky), stal by se jinak
-    # referenčním biasem pro celé měření.
-    candidates: List[Tuple[str, np.ndarray]] = []
-    rejected: List[Tuple[str, str]] = []
-    for path in image_paths[: max(n, SHAPE_PROBE_COUNT)]:
-        try:
-            frame = load_frame(path, full_scale=full_scale)
-        except FrameReadError as exc:
-            rejected.append((path, str(exc)))
-            continue
-        candidates.append((path, frame.data))
-
-    if not candidates:
+    probe = probe_series_shape(image_paths, params, full_scale, probe_count=max(n, SHAPE_PROBE_COUNT))
+    if not probe.frames:
         raise ValueError("Ze začátku série se nepodařilo načíst žádný snímek.")
 
-    shape_counts: Dict[Tuple[int, int], int] = {}
-    for _path, data in candidates:
-        shape_counts[data.shape] = shape_counts.get(data.shape, 0) + 1
-    # Nejčastější rozlišení; při shodě vyhraje to, které se objevilo dřív.
-    source_shape = max(shape_counts, key=lambda shape: shape_counts[shape])
-
-    for path, data in candidates:
-        if data.shape != source_shape:
-            rejected.append((
-                path,
-                f"rozlišení {data.shape[1]}×{data.shape[0]} px neodpovídá sérii "
-                f"({source_shape[1]}×{source_shape[0]} px)",
-            ))
-
+    source_shape = probe.source_shape
+    rejected = list(probe.rejected)
     binning = params.resolve_binning(source_shape[0])
-    usable = [(path, data) for path, data in candidates if data.shape == source_shape][:n]
+    usable = probe.frames[:n]
     prepared = [apply_geometry(data, binning, params.roi) for _path, data in usable]
     bias_paths = [path for path, _data in usable]
 
@@ -334,6 +448,140 @@ def compute_bias(
         frame_paths=bias_paths,
         rejected_paths=rejected,
     )
+
+
+# ---------------------------------------------------------------------------
+# Bias z externí reference (.npz z BMS Cam Control)
+# ---------------------------------------------------------------------------
+
+def bias_from_reference(
+    record: ReferenceRecord,
+    params: AnalysisParams,
+    source_shape: Tuple[int, int],
+    full_scale: float = 255.0,
+    rejected_paths: Optional[Sequence[Tuple[str, str]]] = None,
+) -> BiasModel:
+    """Postaví :class:`BiasModel` z uložené reference.
+
+    Reference se pořizuje na stejné rozlišení jako měření, ale kdyby se
+    lišila (jiný režim kamery), přeškáluje se – pozadí je nízkofrekvenční,
+    takže interpolace ho nezkreslí. Rozdílné rozlišení se hlásí jako
+    upozornění, protože obvykle znamená, že reference patří k jinému měření.
+
+    Raises:
+        ReferenceError: referenci nelze načíst.
+    """
+    planes = load_reference(record)
+    # Reference je uložená v jednotkách senzoru (8bit 0–255, 12bit 0–4095),
+    # stejně jako snímky – převede se proto stejnou škálou jako ony.
+    reference = scale_to_adu(planes.mono, full_scale)
+
+    if reference.shape != tuple(source_shape):
+        reference = cv2.resize(
+            reference, (source_shape[1], source_shape[0]), interpolation=cv2.INTER_AREA
+        )
+
+    binning = params.resolve_binning(source_shape[0])
+    data = apply_geometry(reference, binning, params.roi)
+
+    return BiasModel(
+        data=np.ascontiguousarray(data, dtype=np.float32),
+        frames_used=int(planes.frames or record.frames or 1),
+        binning=binning,
+        full_scale=float(full_scale),
+        source_shape=tuple(int(v) for v in source_shape),  # type: ignore[arg-type]
+        frame_paths=[],                      # žádný snímek série se nespotřebuje
+        rejected_paths=list(rejected_paths or []),
+        origin="reference",
+        reference_path=record.npz_path,
+        reference_created=record.created,
+        reference_label=record.label,
+    )
+
+
+def estimate_reference_offset(
+    image_paths: Sequence[str],
+    bias: BiasModel,
+    params: AnalysisParams,
+    samples: int = REFERENCE_LEVEL_SAMPLES,
+) -> float:
+    """Odhadne konstantní posun úrovně mezi externí referencí a sérií [ADU].
+
+    Postup: u několika snímků rovnoměrně rozložených po sérii se změří úroveň
+    pozadí jako nízký percentil nízkofrekvenční složky diference (tedy jas
+    nejtmavšího místa pole, kde kontaminace není). Z těchto hodnot se vezme
+    **minimum přes celou sérii**.
+
+    Proč minimum: v temném poli kontaminace jen *přidává* světlo, nikdy ho
+    neubírá. Konstantní rozdíl přístrojového původu je proto v každém snímku
+    stejný, kdežto zamlžení se v čase mění – nejnižší naměřená úroveň je tak
+    nejlepší odhad skutečné nuly. Kdyby se posun počítal pro každý snímek
+    zvlášť, odečetlo by se i plošné zamlžení, které má analýza naopak měřit.
+
+    Cenou je, že se odečte i kontaminace, která je po celou sérii konstantní.
+    Proto se korekce používá jen u externí reference a jen nad mezí
+    :data:`REFERENCE_LEVEL_DEADBAND_ADU`.
+    """
+    paths = list(image_paths)
+    if not paths:
+        return 0.0
+
+    count = max(1, min(int(samples), len(paths)))
+    if count == 1:
+        picks = [paths[0]]
+    else:
+        step = (len(paths) - 1) / float(count - 1)
+        picks = [paths[int(round(i * step))] for i in range(count)]
+
+    levels: List[float] = []
+    for path in picks:
+        try:
+            frame = load_frame(path, full_scale=bias.full_scale, mono_mode=params.mono_mode)
+        except FrameReadError:
+            continue
+        if frame.data.shape != bias.source_shape:
+            continue
+        prepared = apply_geometry(frame.data, bias.binning, params.roi)
+        diff = cv2.subtract(prepared, match_shape(bias.data, prepared.shape[:2]))
+        _haze_full, haze_small = separate_haze(diff)
+        if haze_small.size:
+            levels.append(float(np.percentile(haze_small, REFERENCE_LEVEL_PERCENTILE)))
+
+    if not levels:
+        return 0.0
+    offset = min(levels)
+    return offset if abs(offset) >= REFERENCE_LEVEL_DEADBAND_ADU else 0.0
+
+
+def resolve_reference(
+    image_paths: Sequence[str],
+    params: AnalysisParams,
+    folder: Optional[str] = None,
+) -> Tuple[Optional[ReferenceChoice], Optional[str]]:
+    """Najde a vybere referenci pro sérii. Vrací ``(volba, složka)``.
+
+    Reference se vybírá podle času **prvního snímku série** – hledá se ta
+    poslední pořízená ještě před ním, protože jen taková popisuje pozadí
+    platné v okamžiku měření.
+    """
+    if not image_paths:
+        return None, None
+
+    base = folder or os.path.dirname(os.path.abspath(image_paths[0]))
+    reference_dir = params.reference_dir
+    if reference_dir and os.path.isdir(reference_dir):
+        directory: Optional[str] = reference_dir
+    else:
+        directory = find_reference_dir(base, extra_roots=[reference_dir] if reference_dir else ())
+
+    if not directory:
+        return None, None
+
+    records = list_references(directory)
+    if not records:
+        return ReferenceChoice(record=None, reason="Složka s referencemi je prázdná."), directory
+
+    return select_reference(records, series_start_time(image_paths)), directory
 
 
 # ---------------------------------------------------------------------------
@@ -578,8 +826,19 @@ def analyze_prepared_frame(
     t0: datetime,
     binning: int,
     generate_masks: bool = False,
+    level_offset: float = 0.0,
 ) -> Tuple[FrameMetrics, Optional[Dict[str, np.ndarray]]]:
-    """Analyzuje snímek, který je již ve float32 ADU a v geometrii analýzy."""
+    """Analyzuje snímek, který je již ve float32 ADU a v geometrii analýzy.
+
+    ``level_offset`` je konstantní posun úrovně (v ADU), který se od diference
+    odečte. Používá se jen u **externí reference**: ta vznikla v jiném
+    okamžiku, takže se od snímků může lišit konstantou (jiná teplota senzoru,
+    jiný jas zdroje, u barevné kamery jiný převod na mono) a bez srovnání by
+    taková konstanta prošla jako plošné zamlžení přes celý snímek. Posun se
+    odhaduje **jednou pro celou sérii** (viz :func:`estimate_reference_offset`),
+    ne pro každý snímek zvlášť – jinak by se odečetlo i skutečné zamlžení,
+    které je v každém snímku jiné.
+    """
     image = np.ascontiguousarray(image, dtype=np.float32)
     bias = match_shape(np.asarray(bias, dtype=np.float32), image.shape[:2])
 
@@ -588,9 +847,12 @@ def analyze_prepared_frame(
     px_scale = float(binning * binning)        # px po binningu → px plného rozlišení
 
     diff = cv2.subtract(image, bias)
-    bg_level, bg_sigma = estimate_noise(diff)
+    reference_offset = float(level_offset)
+    if abs(reference_offset) > 1e-3:
+        diff = diff - np.float32(reference_offset)
 
     haze_full, haze_small = separate_haze(diff)
+    bg_level, bg_sigma = estimate_noise(diff)
     sharp = cv2.subtract(diff, haze_full)
 
     # --- práh pro ostrou složku -------------------------------------------
@@ -718,6 +980,7 @@ def analyze_prepared_frame(
         centroid_y_pct=cy_pct,
         focus_score=focus,
         cleanliness_score=cleanliness,
+        reference_offset_adu=reference_offset,
     )
 
     masks: Optional[Dict[str, np.ndarray]] = None
@@ -751,7 +1014,7 @@ def analyze_frame_file(
     generate_masks: bool = False,
 ) -> Tuple[FrameMetrics, Optional[Dict[str, np.ndarray]]]:
     """Načte snímek ze souboru a zanalyzuje ho."""
-    frame = load_frame(path, full_scale=bias.full_scale)
+    frame = load_frame(path, full_scale=bias.full_scale, mono_mode=params.mono_mode)
     if frame.data.shape != bias.source_shape:
         # Druhá pojistka proti cizím obrázkům ve složce (exportované grafy,
         # náhledy, snímky z jiného měření): rozměr musí sedět na zbytek série.
@@ -771,6 +1034,7 @@ def analyze_frame_file(
         t0=t0,
         binning=bias.binning,
         generate_masks=generate_masks,
+        level_offset=bias.level_offset_adu,
     )
 
 
@@ -965,6 +1229,95 @@ def resolve_workers(params: AnalysisParams, megapixels: float = 0.0) -> int:
     return requested
 
 
+def _build_bias(
+    paths: Sequence[str],
+    params: AnalysisParams,
+    full_scale: float,
+    result: SeriesResult,
+) -> BiasModel:
+    """Vybere zdroj referenčního pozadí a sestaví :class:`BiasModel`.
+
+    Pořadí:
+
+    1. ``reference_mode="serie"`` – bias se počítá z prvních snímků série.
+    2. jinak se hledá složka s referencemi a vybere se ta pořízená naposledy
+       **před** začátkem měření;
+    3. ``reference_mode="auto"`` navíc při jakémkoli problému (chybí složka,
+       poškozený .npz) tiše spadne zpět na bias ze série, ať analýza doběhne.
+       ``reference_mode="reference"`` naopak selže, aby se výsledek nepočítal
+       proti jinému pozadí, než uživatel čekal.
+    """
+    mode = (params.reference_mode or "auto").strip().lower()
+    if mode in ("serie", "série", "series", "vypnuto", "off"):
+        return compute_bias(paths, params, full_scale=full_scale)
+
+    strict = mode in ("reference", "vzdy", "vždy")
+    choice, directory = resolve_reference(paths, params)
+    result.reference_dir = directory
+
+    if choice is None or not choice.ok:
+        message = (
+            choice.reason if choice is not None
+            else "Složka s referencemi (…/reference) nebyla nalezena."
+        )
+        if strict:
+            raise ReferenceError(message)
+        # V automatickém režimu je návrat k biasu ze série normální provoz,
+        # ne chyba – proto jen poznámka, ne varovný dialog.
+        result.notes.append(f"{message} Použit bias z prvních snímků série.")
+        return compute_bias(paths, params, full_scale=full_scale)
+
+    record = choice.record
+    assert record is not None
+
+    # Rozlišení série se určuje vždy ze snímků, i když pozadí přijde odjinud –
+    # jinak by se do měření dostaly cizí soubory ležící ve složce.
+    probe = probe_series_shape(paths, params, full_scale)
+    if not probe.frames:
+        raise ValueError("Ze začátku série se nepodařilo načíst žádný snímek.")
+
+    try:
+        bias = bias_from_reference(
+            record,
+            params,
+            source_shape=probe.source_shape,
+            full_scale=full_scale,
+            rejected_paths=probe.rejected,
+        )
+    except ReferenceError as exc:
+        if strict:
+            raise
+        result.warnings.append(f"{exc} Použit bias z prvních snímků série.")
+        return compute_bias(paths, params, full_scale=full_scale)
+
+    result.reference = record
+    result.reference_note = choice.reason
+    result.notes.append(choice.reason)
+    if choice.taken_after:
+        result.warnings.append(
+            "Použitá reference je novější než měřené snímky – výsledky ověřte,"
+            " pozadí nemuselo v době měření ještě platit."
+        )
+    if record.resolution and tuple(record.resolution) != tuple(probe.source_shape):
+        result.warnings.append(
+            f"Reference má rozlišení {record.resolution[1]}×{record.resolution[0]} px,"
+            f" série {probe.source_shape[1]}×{probe.source_shape[0]} px – pozadí bylo přeškálováno."
+        )
+
+    if params.match_reference_level:
+        rejected = {path for path, _reason in probe.rejected}
+        usable = [path for path in paths if path not in rejected]
+        bias.level_offset_adu = estimate_reference_offset(usable, bias, params)
+        if abs(bias.level_offset_adu) > REFERENCE_LEVEL_WARN_ADU:
+            direction = "světlejší" if bias.level_offset_adu > 0 else "tmavší"
+            result.warnings.append(
+                f"Snímky jsou proti referenci systematicky o {abs(bias.level_offset_adu):.1f} ADU"
+                f" {direction}; úroveň byla srovnána. Ověřte, že reference patří k tomuto"
+                f" měření a že sedí režim převodu barvy ({params.mono_label})."
+            )
+    return bias
+
+
 def analyze_series(
     image_paths: Sequence[str],
     params: AnalysisParams,
@@ -987,10 +1340,10 @@ def analyze_series(
     started = time.perf_counter()
     full_scale = probe_full_scale(paths)
     if bias is None:
-        bias = compute_bias(paths, params, full_scale=full_scale)
+        bias = _build_bias(paths, params, full_scale, result)
     result.bias = bias
 
-    if bias.frames_used < params.bias_frames:
+    if not bias.is_external and bias.frames_used < params.bias_frames:
         result.warnings.append(
             f"Pro bias bylo použito jen {bias.frames_used} z požadovaných {params.bias_frames} snímků."
         )
@@ -1114,8 +1467,13 @@ __all__ = [
     "AnalysisParams",
     "BiasModel",
     "FrameMetrics",
+    "SeriesProbe",
     "SeriesResult",
     "analyze_frame_file",
+    "bias_from_reference",
+    "estimate_reference_offset",
+    "probe_series_shape",
+    "resolve_reference",
     "analyze_prepared_frame",
     "analyze_series",
     "apply_geometry",

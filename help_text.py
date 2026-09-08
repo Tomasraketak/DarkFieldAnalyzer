@@ -28,14 +28,67 @@ rozptyluje světlo do objektivu a září.</p>
 
 <h3>1. Referenční bias (odečet pozadí)</h3>
 <div class="box">
-    <b>Co dělá:</b> Z prvních <i>N</i> snímků sestaví referenční mapu pozadí a tu odečte
-    od každého dalšího snímku: <code>diference = snímek − bias</code>.<br>
+    <b>Co dělá:</b> Od každého snímku odečte referenční mapu pozadí:
+    <code>diference = snímek − bias</code>.<br>
     <b>Co filtruje:</b> prach usazený na optice mikroskopu, horké pixely senzoru,
     nerovnoměrné osvětlení. Měříte tedy <b>jen nově vzniklou kontaminaci</b>.<br>
-    <b>Metoda:</b> <i>medián</i> (výchozí) je odolný – jedna náhodná částice v bias snímku
-    referenci nezkazí. <i>Průměr</i> je o něco tišší, ale citlivý na výjimečné hodnoty.<br>
-    <b>Kolik snímků:</b> 3–5 je dobrý kompromis. Při 1 snímku se do reference propíše
-    i jeho vlastní šum, takže prahy vycházejí méně stabilní.
+    <b>Odkud pozadí pochází</b> (panel „1b. Referenční pozadí“):<br>
+    • <b>Automaticky</b> (výchozí) – použije se reference uložená programem
+    BMS Cam Control ve složce <code>reference</code>; když žádná není, spočítá se
+    bias z prvních snímků série.<br>
+    • <b>Vždy ze složky s referencemi</b> – bez reference analýza skončí chybou.
+    Hodí se, když chcete mít jistotu, že se neměří proti prvním snímkům měření.<br>
+    • <b>Vždy z prvních snímků série</b> – původní chování, reference se ignoruje.<br>
+    <b>Metoda</b> (jen pro bias ze série): <i>medián</i> (výchozí) je odolný – jedna
+    náhodná částice v bias snímku referenci nezkazí. <i>Průměr</i> je o něco tišší,
+    ale citlivý na výjimečné hodnoty. 3–5 snímků je dobrý kompromis.<br>
+    <b>Pozor:</b> snímky, ze kterých se bias počítá, se porovnávají samy se sebou,
+    takže se z výsledné řady vynechávají. <b>Externí reference tuto daň neplatí</b> –
+    zpracují se všechny snímky ve složce.
+</div>
+
+<h3>1b. Reference ze složky <code>reference</code></h3>
+<div class="box">
+    <b>Formát:</b> dvojice souborů, které ukládá záznamový program:
+    <code>reference_20260908_142910.npz</code> (průměr N tmavých snímků v poli
+    <code>mean_mono</code>) a stejnojmenný <code>.json</code> s nastavením kamery
+    a osvětlení. JSON slouží jen k popisu, analýza z něj nic nepřebírá.<br>
+    <b>Kde se hledá:</b> podsložka <code>reference</code> nejdřív přímo u měření,
+    pak v nadřazených složkách – typicky
+    <code>…\\BMS fotky\\reference</code> vedle složek s měřeními. Tlačítkem
+    <b>Složka…</b> se dá určit ručně, tlačítkem <b>Auto</b> zrušit zpět.<br>
+    <b>Která se vybere:</b> ta, která vznikla <b>naposledy před začátkem měření</b>.
+    Čas se čte z názvu souboru, takže se kvůli výběru nemusí rozbalovat obrazová data.
+    Pozdější reference nikdy nevyhraje, ani když je časově blíž – popisovala by
+    pozadí, které v době měření ještě neplatilo. Když existují jen pozdější,
+    použije se nejbližší z nich a analýza to ohlásí jako upozornění.<br>
+    <b>Srovnat úroveň reference se snímky:</b> reference vznikla v jiném okamžiku,
+    takže se od snímků může lišit konstantním posunem jasu (teplota senzoru, jas
+    zdroje). Bez srovnání by se takový posun projevil jako <b>plošné zamlžení přes
+    celý snímek</b>. Posun se odhaduje <b>jednou pro celou sérii</b> jako nejnižší
+    naměřená úroveň pozadí – v temném poli totiž kontaminace jas jen přidává, takže
+    nejtmavší snímek je nejlepší odhad skutečné nuly. Kdyby se počítal pro každý
+    snímek zvlášť, odečetlo by se i skutečné zamlžení. Daní je, že se odečte
+    i kontaminace, která je po celou sérii úplně stejná; posun menší než 0,5 ADU
+    se ignoruje, takže dobře sedící reference se nijak „neopravuje“. Skutečnou
+    hodnotu najdete v souhrnu i v exportovaném JSON.
+</div>
+
+<h3>1c. Barevné a černobílé snímky</h3>
+<div class="box">
+    Aplikace zpracuje obojí. Barevný snímek se převede na intenzitu podle volby
+    <b>Barevný snímek jako</b>:<br>
+    • <b>Vážený jas – Rec.601</b> (výchozí, doporučeno) – standardní černobílý převod,
+    stejný, jakým počítá mono kanál sama kamera. Sedí proto na referenci
+    <code>mean_mono</code>.<br>
+    • <b>Průměr kanálů</b> – nepodceňuje modrou, takže modravé rozptylové halo částic
+    v temném poli má plnou váhu.<br>
+    • <b>Maximum kanálů</b> – nejcitlivější na částice svítící jen v jednom kanálu,
+    ale zvyšuje i šum pozadí.<br>
+    • <b>Jen červený / zelený / modrý kanál</b> – pro cílené měření jedné barvy.<br>
+    Pokud změníte volbu a reference zůstane mono, může vzniknout posun úrovně –
+    postará se o něj srovnání popsané výše, ale hodnoty pak nejsou přímo srovnatelné
+    s měřením v jiném režimu.
 </div>
 
 <h3>2. Difuzní zamlžení a kondenzace (Haze) – <b class="blue">azurová</b></h3>
@@ -151,5 +204,14 @@ rozptyluje světlo do objektivu a září.</p>
 <tr><td>Analýza je pomalá</td>
     <td>Zvolte binning 2×2, případně zvyšte počet vláken CPU (0 = automaticky).</td></tr>
 <tr><td>Plochy v µm² jsou nesmyslné</td><td>Nastavte správné <b>Měřítko [µm/px]</b> podle kalibrace objektivu.</td></tr>
+<tr><td>Celá plocha se hlásí jako zamlžená</td>
+    <td>Reference nesedí na snímky. Zapněte <b>Srovnat úroveň reference se snímky</b>
+    a zkontrolujte v souhrnu, kterou referenci analýza vzala a jaký posun naměřila.</td></tr>
+<tr><td>Použila se jiná reference, než jsem čekal</td>
+    <td>Vybírá se poslední pořízená <i>před</i> měřením. Zkontrolujte čas v názvu
+    souboru <code>reference_RRRRMMDD_HHMMSS.npz</code>; složku lze určit i ručně.</td></tr>
+<tr><td>Barevné snímky vycházejí jinak než mono</td>
+    <td>Zkontrolujte volbu <b>Barevný snímek jako</b> – na referenci
+    <code>mean_mono</code> sedí <i>Vážený jas (Rec.601)</i>.</td></tr>
 </table>
 """
