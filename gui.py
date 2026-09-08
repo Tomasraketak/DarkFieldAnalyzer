@@ -27,7 +27,7 @@ import traceback
 from datetime import datetime
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -44,6 +45,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -156,7 +158,7 @@ class DarkfieldAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Analýza kontaminace sklíčka v temném poli (Dark-Field Analyzer)")
-        self.resize(1440, 900)
+        self.setMinimumSize(940, 560)
 
         self.settings = QSettings(APP_ORG, APP_NAME)
         self.current_base_dir = self.settings.value("base_dir", "", type=str)
@@ -171,7 +173,49 @@ class DarkfieldAnalyzerGUI(QMainWindow):
 
         self.init_ui()
         self.restore_settings()
+        self.restore_geometry()
         self.refresh_folder_list()
+
+    # -- velikost okna ------------------------------------------------------
+
+    def restore_geometry(self) -> None:
+        """Nastaví velikost okna tak, aby se vždy vešlo na obrazovku.
+
+        Pevná velikost 1440×900 byla problém na noteboocích s Full HD a
+        škálováním Windows 150 %: plocha má pak jen 1280×720 logických bodů,
+        takže okno bylo větší než displej a spodní tlačítka byla mimo obraz.
+        Uloženou geometrii z minula proto vždy ještě ořízneme na aktuální
+        obrazovku – po přepojení na jiný monitor se okno nemůže „ztratit“.
+        """
+        available = self._available_geometry()
+        max_w, max_h = available.width(), available.height()
+
+        saved = self.settings.value("window_geometry", None)
+        restored = bool(saved) and self.restoreGeometry(saved)
+
+        width = min(self.width() if restored else 1380, int(max_w * 0.96))
+        height = min(self.height() if restored else 880, int(max_h * 0.96))
+        width = max(width, min(self.minimumWidth(), max_w))
+        height = max(height, min(self.minimumHeight(), max_h))
+        self.resize(width, height)
+
+        if not restored or not available.contains(self.geometry()):
+            frame = self.frameGeometry()
+            frame.moveCenter(available.center())
+            self.move(max(available.left(), frame.left()), max(available.top(), frame.top()))
+
+        # Levý panel dostane rozumný podíl šířky i na úzkém displeji.
+        left = max(300, min(430, int(width * 0.32)))
+        self.splitter.setSizes([left, max(320, width - left)])
+
+    def _available_geometry(self):
+        """Plocha obrazovky bez hlavního panelu (v logických bodech)."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            from PyQt6.QtCore import QRect
+
+            return QRect(0, 0, 1280, 720)
+        return screen.availableGeometry()
 
     # -- sestavení rozhraní -------------------------------------------------
 
@@ -181,16 +225,30 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         layout = QHBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter)
-        splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_tabs())
-        splitter.setSizes([460, 980])
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(self.splitter)
+
+        # Levý panel je vysoký; na nízkém displeji se musí dát rolovat,
+        # jinak by roztáhl celé okno mimo obrazovku.
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(self._build_left_panel())
+        left_scroll.setMinimumWidth(300)
+        left_scroll.setMaximumWidth(520)
+
+        self.splitter.addWidget(left_scroll)
+        self.splitter.addWidget(self._build_tabs())
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setChildrenCollapsible(False)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
         column = QVBoxLayout(panel)
         column.setContentsMargins(4, 4, 4, 4)
+        column.setSpacing(6)
 
         # 1. Složka -----------------------------------------------------------
         dir_group = QGroupBox("1. Složka s měřeními")
@@ -201,7 +259,8 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.lbl_base_dir.setStyleSheet(
             "font-size: 11px; background: #2B2B2B; color: #FFF; padding: 4px; border-radius: 4px;"
         )
-        self.lbl_base_dir.setWordWrap(True)
+        self.lbl_base_dir.setWordWrap(False)
+        self.lbl_base_dir.setMinimumWidth(120)
         row.addWidget(self.lbl_base_dir, 1)
         btn_browse = QPushButton("Procházet…")
         btn_browse.clicked.connect(self.browse_base_dir)
@@ -219,6 +278,9 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.folder_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.folder_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.folder_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.folder_table.setMinimumHeight(96)
+        self.folder_table.setMaximumHeight(200)
+        self.folder_table.verticalHeader().setDefaultSectionSize(22)
         self.folder_table.itemSelectionChanged.connect(self.on_folder_selected)
         dir_layout.addWidget(self.folder_table)
 
@@ -228,148 +290,142 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         column.addWidget(dir_group)
 
         # 2. Parametry --------------------------------------------------------
+        # Jeden sloupec (QFormLayout): dvojice ovládacích prvků vedle sebe se
+        # na úzkém panelu ořezávaly, protože se nevešly do dostupné šířky.
         params_group = QGroupBox("2. Parametry analýzy")
-        grid = QVBoxLayout(params_group)
+        form = QFormLayout(params_group)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(5)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Rozlišení analýzy:"))
         self.combo_res = QComboBox()
         self.combo_res.addItems([
             "Automaticky (doporučeno)",
-            "Plné rozlišení (nejpřesnější, nejpomalejší)",
+            "Plné rozlišení",
             "Poloviční – binning 2×2",
-            "Čtvrtinové – binning 4×4 (nejrychlejší)",
+            "Čtvrtinové – binning 4×4",
         ])
         self.combo_res.setToolTip(
             "Automaticky = 4K se zpracuje v polovičním rozlišení, FHD v plném.\n"
             "Binning průměruje sousední pixely, takže zlepšuje poměr signál/šum."
         )
-        row.addWidget(self.combo_res, 1)
-        grid.addLayout(row)
+        form.addRow("Rozlišení analýzy:", self.combo_res)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Bias snímků:"))
         self.spin_bias_frames = QSpinBox()
         self.spin_bias_frames.setRange(1, 50)
         self.spin_bias_frames.setValue(3)
         self.spin_bias_frames.setToolTip("Z kolika prvních snímků se vytvoří referenční pozadí.")
-        row.addWidget(self.spin_bias_frames)
-        row.addWidget(QLabel("Metoda:"))
+        form.addRow("Bias snímků:", self.spin_bias_frames)
+
         self.combo_bias_method = QComboBox()
         self.combo_bias_method.addItems(["medián (odolný)", "průměr"])
-        row.addWidget(self.combo_bias_method, 1)
-        grid.addLayout(row)
+        form.addRow("Metoda biasu:", self.combo_bias_method)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Režim prahu:"))
+        mode_row = QWidget()
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
         self.radio_sigma = QRadioButton("Sigma (šum)")
         self.radio_sigma.setChecked(True)
         self.radio_absolute = QRadioButton("Absolutní")
-        row.addWidget(self.radio_sigma)
-        row.addWidget(self.radio_absolute)
-        grid.addLayout(row)
+        mode_layout.addWidget(self.radio_sigma)
+        mode_layout.addWidget(self.radio_absolute)
+        mode_layout.addStretch()
+        form.addRow("Režim prahu:", mode_row)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Sigma:"))
         self.spin_sigma = QDoubleSpinBox()
         self.spin_sigma.setRange(0.5, 30.0)
         self.spin_sigma.setSingleStep(0.5)
         self.spin_sigma.setValue(4.0)
-        row.addWidget(self.spin_sigma)
-        row.addWidget(QLabel("Absolutní [ADU]:"))
+        form.addRow("Sigma [× σ]:", self.spin_sigma)
+
         self.spin_abs = QDoubleSpinBox()
         self.spin_abs.setRange(1.0, 255.0)
         self.spin_abs.setValue(12.0)
-        row.addWidget(self.spin_abs)
-        grid.addLayout(row)
+        form.addRow("Absolutní práh [ADU]:", self.spin_abs)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Práh zamlžení [ADU]:"))
         self.spin_haze = QDoubleSpinBox()
         self.spin_haze.setRange(0.5, 60.0)
         self.spin_haze.setSingleStep(0.5)
         self.spin_haze.setValue(4.0)
-        row.addWidget(self.spin_haze)
-        row.addWidget(QLabel("Hotspot od [ADU]:"))
+        form.addRow("Práh zamlžení [ADU]:", self.spin_haze)
+
         self.spin_saturation = QDoubleSpinBox()
         self.spin_saturation.setRange(100.0, 255.0)
         self.spin_saturation.setValue(250.0)
-        row.addWidget(self.spin_saturation)
-        grid.addLayout(row)
+        form.addRow("Hotspot od [ADU]:", self.spin_saturation)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Min. plocha [px]:"))
         self.spin_min_area = QSpinBox()
         self.spin_min_area.setRange(1, 200)
         self.spin_min_area.setValue(3)
-        row.addWidget(self.spin_min_area)
-        row.addWidget(QLabel("Shluk od [px]:"))
+        form.addRow("Min. plocha částice [px]:", self.spin_min_area)
+
         self.spin_cluster_area = QSpinBox()
         self.spin_cluster_area.setRange(20, 20000)
         self.spin_cluster_area.setSingleStep(20)
         self.spin_cluster_area.setValue(100)
-        row.addWidget(self.spin_cluster_area)
-        grid.addLayout(row)
+        form.addRow("Velký shluk od [px]:", self.spin_cluster_area)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Protáhlost vlákna:"))
         self.spin_aspect_ratio = QDoubleSpinBox()
         self.spin_aspect_ratio.setRange(1.5, 20.0)
         self.spin_aspect_ratio.setValue(2.8)
         self.spin_aspect_ratio.setToolTip("Poměr hlavní a vedlejší osy ekvivalentní elipsy.")
-        row.addWidget(self.spin_aspect_ratio)
-        row.addWidget(QLabel("Min. délka [px]:"))
+        form.addRow("Protáhlost vlákna:", self.spin_aspect_ratio)
+
         self.spin_fiber_len = QSpinBox()
         self.spin_fiber_len.setRange(3, 500)
         self.spin_fiber_len.setValue(12)
-        row.addWidget(self.spin_fiber_len)
-        grid.addLayout(row)
+        form.addRow("Min. délka vlákna [px]:", self.spin_fiber_len)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Měřítko [µm/px]:"))
         self.spin_scale = QDoubleSpinBox()
         self.spin_scale.setRange(0.0, 1000.0)
         self.spin_scale.setDecimals(4)
         self.spin_scale.setValue(1.0)
-        row.addWidget(self.spin_scale)
-        row.addWidget(QLabel("Vláken CPU:"))
+        form.addRow("Měřítko [µm/px]:", self.spin_scale)
+
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(0, 16)
         self.spin_workers.setValue(0)
         self.spin_workers.setToolTip("0 = automaticky podle počtu jader procesoru.")
-        row.addWidget(self.spin_workers)
-        grid.addLayout(row)
+        form.addRow("Vláken CPU:", self.spin_workers)
 
-        row = QHBoxLayout()
-        self.chk_roi = QCheckBox("Analyzovat jen výřez (ROI):")
+        # Výřez (ROI): zaškrtávátko a pod ním dvě dvojice souřadnic
+        self.chk_roi = QCheckBox("Analyzovat jen výřez (ROI)")
         self.chk_roi.setToolTip(
             "Souřadnice v pixelech plného rozlišení. Hodí se, když má snímek\n"
             "zajímavou jen část plochy (např. okraj s vinětací se má vynechat)."
         )
-        row.addWidget(self.chk_roi)
-        self.spin_roi = []
-        for label, maximum in (("x", 20000), ("y", 20000), ("š", 20000), ("v", 20000)):
-            row.addWidget(QLabel(label))
-            box = QSpinBox()
-            box.setRange(0, maximum)
-            box.setMaximumWidth(70)
-            row.addWidget(box)
-            self.spin_roi.append(box)
-        self.spin_roi[2].setValue(0)
-        self.spin_roi[3].setValue(0)
-        grid.addLayout(row)
+        form.addRow(self.chk_roi)
 
-        self.chk_exclude_bias = QCheckBox("Vynechat bias snímky z výsledné řady (doporučeno)")
+        self.spin_roi = []
+        roi_row = QWidget()
+        roi_layout = QHBoxLayout(roi_row)
+        roi_layout.setContentsMargins(0, 0, 0, 0)
+        roi_layout.setSpacing(4)
+        for label in ("x", "y", "š", "v"):
+            roi_layout.addWidget(QLabel(label))
+            box = QSpinBox()
+            box.setRange(0, 20000)
+            box.setMinimumWidth(52)
+            box.setEnabled(False)
+            roi_layout.addWidget(box, 1)
+            self.spin_roi.append(box)
+        self.chk_roi.toggled.connect(lambda on: [box.setEnabled(on) for box in self.spin_roi])
+        form.addRow("Výřez [px]:", roi_row)
+
+        self.chk_exclude_bias = QCheckBox("Vynechat bias snímky z výsledků")
         self.chk_exclude_bias.setChecked(True)
         self.chk_exclude_bias.setToolTip(
             "Snímky použité pro bias se porovnávají samy se sebou, takže jejich\n"
             "hodnoty nejsou srovnatelné se zbytkem řady."
         )
-        grid.addWidget(self.chk_exclude_bias)
+        form.addRow(self.chk_exclude_bias)
 
         btn_defaults = QPushButton("Obnovit výchozí hodnoty")
         btn_defaults.clicked.connect(self.reset_defaults)
-        grid.addWidget(btn_defaults)
+        form.addRow(btn_defaults)
 
         column.addWidget(params_group)
 
@@ -416,32 +472,36 @@ class DarkfieldAnalyzerGUI(QMainWindow):
 
     def _build_tabs(self) -> QTabWidget:
         self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMinimumWidth(320)
 
-        self.fig_coverage = Figure(figsize=(7, 5), dpi=100)
-        self.canvas_coverage = self._add_plot_tab(self.fig_coverage, "📈 Pokrytí a čistota")
+        self.fig_coverage = Figure(figsize=(6.0, 4.0), dpi=96)
+        self.canvas_coverage = self._add_plot_tab(self.fig_coverage, "📈 Pokrytí")
 
-        self.fig_particles = Figure(figsize=(7, 5), dpi=100)
-        self.canvas_particles = self._add_plot_tab(self.fig_particles, "🔬 Typy kontaminace")
+        self.fig_particles = Figure(figsize=(6.0, 4.0), dpi=96)
+        self.canvas_particles = self._add_plot_tab(self.fig_particles, "🔬 Typy")
 
-        self.fig_signal = Figure(figsize=(7, 5), dpi=100)
-        self.canvas_signal = self._add_plot_tab(self.fig_signal, "💡 Signál a hotspoty")
+        self.fig_signal = Figure(figsize=(6.0, 4.0), dpi=96)
+        self.canvas_signal = self._add_plot_tab(self.fig_signal, "💡 Signál")
 
-        self.fig_rates = Figure(figsize=(7, 5), dpi=100)
-        self.canvas_rates = self._add_plot_tab(self.fig_rates, "⚡ Rychlost a nehomogenita")
+        self.fig_rates = Figure(figsize=(6.0, 4.0), dpi=96)
+        self.canvas_rates = self._add_plot_tab(self.fig_rates, "⚡ Rychlost")
 
-        self.fig_composition = Figure(figsize=(7, 7), dpi=100)
-        self.canvas_composition = self._add_plot_tab(self.fig_composition, "🧩 Složení kontaminace")
+        self.fig_composition = Figure(figsize=(6.0, 6.2), dpi=96)
+        self.canvas_composition = self._add_plot_tab(self.fig_composition, "🧩 Složení")
 
         self.viewer_widget = ImageViewerWidget()
-        self.tabs.addTab(self.viewer_widget, "🖼️ Vizuální kontrola")
+        self.tabs.addTab(self.viewer_widget, "🖼️ Snímky")
 
         self.table_results = QTableWidget()
         self.table_results.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.tabs.addTab(self.table_results, "📋 Datová tabulka")
+        self.tabs.addTab(self.table_results, "📋 Tabulka")
 
         self.summary_browser = QTextBrowser()
         self.summary_browser.setHtml("<p style='color:#666;'>Souhrn se zobrazí po dokončení analýzy.</p>")
-        self.tabs.addTab(self.summary_browser, "🧾 Souhrn měření")
+        self.tabs.addTab(self.summary_browser, "🧾 Souhrn")
 
         help_browser = QTextBrowser()
         help_browser.setHtml(HELP_HTML)
@@ -451,9 +511,15 @@ class DarkfieldAnalyzerGUI(QMainWindow):
 
     def _add_plot_tab(self, figure: Figure, title: str) -> FigureCanvas:
         canvas = FigureCanvas(figure)
+        # Bez malé minimální velikosti si plátno vynutí šířku podle figsize
+        # a okno pak nejde zmenšit pod rozlišení displeje.
+        canvas.setMinimumSize(240, 180)
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(NavigationToolbar(canvas, self))
+        layout.setContentsMargins(2, 2, 2, 2)
+        toolbar = NavigationToolbar(canvas, self)
+        toolbar.setIconSize(QSize(18, 18))
+        layout.addWidget(toolbar)
         layout.addWidget(canvas)
         self.tabs.addTab(tab, title)
         return canvas
@@ -560,13 +626,20 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Vyberte složku s měřeními", self.current_base_dir)
         if folder:
             self.current_base_dir = folder
-            self.lbl_base_dir.setText(folder)
+            self._update_base_dir_label()
             self.save_settings()
             self.refresh_folder_list()
 
+    def _update_base_dir_label(self) -> None:
+        """Zobrazí zkrácenou cestu (celá je v tooltipu), aby netlačila na šířku."""
+        parts = os.path.normpath(self.current_base_dir).split(os.sep)
+        short = os.sep.join(parts[-3:]) if len(parts) > 3 else self.current_base_dir
+        self.lbl_base_dir.setText(("…" + os.sep + short) if short != self.current_base_dir else short)
+        self.lbl_base_dir.setToolTip(self.current_base_dir)
+
     def refresh_folder_list(self) -> None:
         self.folder_table.setRowCount(0)
-        self.lbl_base_dir.setText(self.current_base_dir)
+        self._update_base_dir_label()
 
         if not os.path.isdir(self.current_base_dir):
             self.lbl_status.setText("Zvolená složka neexistuje.")
@@ -923,6 +996,7 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(3000)
+        self.settings.setValue("window_geometry", self.saveGeometry())
         self.save_settings()
         super().closeEvent(event)
 

@@ -26,12 +26,27 @@ import numpy as np
 #: Přípony, které aplikace považuje za snímky měření.
 IMAGE_EXTENSIONS: Tuple[str, ...] = (".png", ".tif", ".tiff", ".bmp", ".jpg", ".jpeg")
 
+#: Předpony a přípony souborů, které aplikace sama vytváří.
+#:
+#: Export ukládá grafy jako PNG přímo do složky s měřením, takže při druhém
+#: spuštění by je hledání snímků našlo jako běžné snímky. Protože se řadí
+#: abecedně před ``df_00001_…``, staly by se z nich dokonce **bias snímky**
+#: a celá analýza by se počítala proti obrázku grafu.
+OUTPUT_NAME_PREFIXES: Tuple[str, ...] = ("analyza_", "analýza_")
+OUTPUT_NAME_MARKERS: Tuple[str, ...] = (
+    "_grafy", "_nahled", "_náhled", "_souhrn", "_overlay", "_maska", "_slozeni", "_složení",
+)
+
 #: Referenční rozsah, na který se všechny snímky normalizují (8bitová škála ADU).
 DISPLAY_FULL_SCALE = 255.0
 
 
 class FrameReadError(RuntimeError):
     """Snímek se nepodařilo načíst nebo dekódovat."""
+
+
+class FrameShapeError(FrameReadError):
+    """Snímek má jiné rozlišení než zbytek série – do měření nepatří."""
 
 
 @dataclass(frozen=True)
@@ -151,32 +166,60 @@ def probe_full_scale(paths: Sequence[str], sample: int = 3) -> float:
 _NUM_RE = re.compile(r"(\d+)")
 
 
+def is_analysis_output(path: str) -> bool:
+    """Pozná soubor, který vytvořila samotná aplikace (graf, náhled, souhrn).
+
+    Slouží jako pojistka, aby se exportované grafy uložené ve složce s měřením
+    nedostaly do analýzy jako snímky – a hlavně ne jako referenční bias.
+    """
+    name = os.path.basename(path).lower()
+    stem = os.path.splitext(name)[0]
+    if any(name.startswith(prefix) for prefix in OUTPUT_NAME_PREFIXES):
+        return True
+    return any(marker in stem for marker in OUTPUT_NAME_MARKERS)
+
+
 def natural_sort_key(text: str):
     """Přirozené řazení (``img2`` před ``img10``)."""
     return [int(part) if part.isdigit() else part.lower() for part in _NUM_RE.split(text)]
 
 
-def list_image_files(folder: str, recursive: bool = False) -> List[str]:
-    """Vrátí seřazený seznam snímků ve složce."""
+def list_image_files(
+    folder: str,
+    recursive: bool = False,
+    skip_outputs: bool = True,
+) -> List[str]:
+    """Vrátí seřazený seznam snímků ve složce.
+
+    ``skip_outputs`` vynechá soubory, které vytvořila sama aplikace
+    (exportované grafy, uložené náhledy) – viz :func:`is_analysis_output`.
+    """
     if not os.path.isdir(folder):
         return []
+
+    def accept(name: str, full: str) -> bool:
+        if not name.lower().endswith(IMAGE_EXTENSIONS):
+            return False
+        if skip_outputs and is_analysis_output(name):
+            return False
+        return os.path.isfile(full)
 
     found: List[str] = []
     if recursive:
         for root, _dirs, files in os.walk(folder):
             for name in files:
-                if name.lower().endswith(IMAGE_EXTENSIONS):
-                    found.append(os.path.join(root, name))
+                full = os.path.join(root, name)
+                if accept(name, full):
+                    found.append(full)
     else:
         try:
             entries = os.listdir(folder)
         except OSError:
             return []
         for name in entries:
-            if name.lower().endswith(IMAGE_EXTENSIONS):
-                full = os.path.join(folder, name)
-                if os.path.isfile(full):
-                    found.append(full)
+            full = os.path.join(folder, name)
+            if accept(name, full):
+                found.append(full)
 
     found.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
     return found

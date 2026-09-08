@@ -133,7 +133,9 @@ class ImageViewerWidget(QWidget):
             "Detekovaná maska (binárně)",
         ])
         self.view_mode_combo.currentIndexChanged.connect(self.trigger_render)
-        controls.addWidget(self.view_mode_combo)
+        self.view_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.view_mode_combo.setMinimumContentsLength(16)
+        controls.addWidget(self.view_mode_combo, 1)
 
         self.chk_fast = QCheckBox("Rychlý náhled (2× zmenšeno)")
         self.chk_fast.setToolTip(
@@ -159,16 +161,22 @@ class ImageViewerWidget(QWidget):
         controls.addWidget(self.btn_save)
 
         controls.addStretch()
-        controls.addWidget(QLabel(
-            "<b>Legenda:</b> "
-            "<span style='color:#00C8FF;'>■</span> zamlžení &nbsp;"
-            "<span style='color:#D4AC0D;'>■</span> mikročástice &nbsp;"
-            "<span style='color:#E74C3C;'>■</span> shluky &nbsp;"
-            "<span style='color:#27AE60;'>■</span> vlákna &nbsp;"
-            "<span style='color:#FF00FF;'>■</span> hotspoty &nbsp;"
-            "<span style='color:#B7950B;'>✚</span> těžiště"
-        ))
         layout.addLayout(controls)
+
+        # Legenda má vlastní řádek a zalamuje se – v jedné liště s ovládáním
+        # si totiž vynutila minimální šířku okna přes 1300 px.
+        legend = QLabel(
+            "<b>Legenda:</b> "
+            "<span style='color:#00A8DF;'>■</span> zamlžení &nbsp;"
+            "<span style='color:#D4900A;'>■</span> mikročástice &nbsp;"
+            "<span style='color:#C0392B;'>■</span> shluky &nbsp;"
+            "<span style='color:#1D8348;'>■</span> vlákna &nbsp;"
+            "<span style='color:#B03AB0;'>■</span> hotspoty &nbsp;"
+            "<span style='color:#8A6D0B;'>✚</span> těžiště kontaminace"
+        )
+        legend.setWordWrap(True)
+        legend.setStyleSheet("font-size: 11px;")
+        layout.addWidget(legend)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
@@ -177,6 +185,7 @@ class ImageViewerWidget(QWidget):
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setMinimumSize(240, 180)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -323,8 +332,8 @@ class ImageViewerWidget(QWidget):
         """Vykreslí RGB pole do QLabel s dopočítaným zmenšením na velikost okna."""
         height, width = rgb.shape[:2]
         viewport = self.scroll_area.viewport()
-        target_w = max(320, viewport.width() - 4)
-        target_h = max(240, viewport.height() - 4)
+        target_w = max(160, viewport.width() - 4)
+        target_h = max(120, viewport.height() - 4)
         scale = min(target_w / width, target_h / height, 1.0)
 
         if scale < 0.99:

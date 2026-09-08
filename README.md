@@ -110,6 +110,18 @@ Další opravené problémy:
 - **Paralelní zpracování** s ohledem na paměť: počet vláken se automaticky sníží,
   aby analýza notebook nevytlačila do odkládacího souboru.
 - **Chyba u jednoho souboru sérii nezastaví** – skončí v seznamu chyb.
+- **Pojistka proti vlastním výstupům.** Exportované grafy se ukládají do složky
+  se snímky, takže při druhém spuštění hrozilo, že se použijí jako snímky měření –
+  a protože se řadí abecedně před `df_00001_…`, staly by se z nich rovnou
+  **bias snímky**. Filtrují se dvakrát: podle názvu (`analyza_*`, `*_grafy`,
+  `*_nahled`, `*_souhrn`, …) a podle rozlišení (to se určí hlasováním z prvních
+  osmi souborů; co mu neodpovídá, se vyřadí a vypíše). Druhá pojistka zachytí
+  i cizí obrázek s nevinným názvem – vyřadí se ještě před sestavením časové osy,
+  takže nezmění ani bias, ani časy snímků.
+- **Okno se přizpůsobí displeji.** Velikost se odvozuje z volné plochy obrazovky
+  (dřív byla pevných 1440×900, což je víc než Full HD se škálováním Windows 150 %,
+  tedy 1280×720 logických bodů – spodek okna byl mimo obraz). Levý panel se
+  roluje, uložená geometrie se ořízne na aktuální monitor.
 - **Dávkový režim** `--batch` zpracuje všechny podsložky jedním příkazem.
 - **Výřez (ROI)** v GUI i na příkazové řádce.
 - **Nastavení se pamatuje** mezi spuštěními (Qt QSettings).
@@ -138,7 +150,8 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
 2. **Parametry analýzy** – rozlišení/binning, počet a metoda bias snímků, režim a
    hodnota prahu, práh zamlžení, hranice hotspotu, minimální plocha částice,
    hranice velkého shluku, protáhlost a délka vlákna, kalibrace µm/px, počet
-   vláken CPU, ROI. Každé pole má nápovědu po najetí myší.
+   vláken CPU, ROI. Každé pole má nápovědu po najetí myší. Panel je v jednom
+   sloupci a roluje se, takže se vejde i na nízký displej.
 3. **Spuštění a export** – průběh, zastavení, export CSV + grafy + JSON.
 
 **Pravý panel**

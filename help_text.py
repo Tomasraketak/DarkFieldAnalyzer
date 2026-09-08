@@ -126,7 +126,21 @@ rozptyluje světlo do objektivu a září.</p>
     • <b class="green">Stabilní:</b> beze změny nad úrovní šumu.
 </div>
 
-<h3>12. Co dělat, když výsledky nesedí</h3>
+<h3>12. Pojistky proti cizím souborům ve složce</h3>
+<div class="box">
+    Export ukládá grafy do stejné složky, kde jsou snímky. Aby se z nich při
+    dalším spuštění nestaly „snímky měření“ (a hlavně ne referenční bias, protože
+    se řadí abecedně před <code>df_00001_…</code>), aplikace hlídá dvě věci:<br>
+    • <b>Název:</b> soubory začínající <code>analyza_</code> a soubory s příponou
+    <code>_grafy</code>, <code>_nahled</code>, <code>_souhrn</code>, <code>_overlay</code>
+    nebo <code>_maska</code> se ignorují.<br>
+    • <b>Rozlišení:</b> rozlišení měření se určí hlasováním z prvních osmi souborů;
+    co mu neodpovídá, se vyřadí a vypíše v upozornění po skončení analýzy.
+    Tím se odfiltruje i cizí obrázek s nevinným názvem.<br>
+    Vyřazené soubory najdete v okně „Upozornění k analýze“ i ve výpisu na příkazové řádce.
+</div>
+
+<h3>13. Co dělat, když výsledky nesedí</h3>
 <table>
 <tr><th>Projev</th><th>Řešení</th></tr>
 <tr><td>Tisíce „částic“ i na čistém sklíčku</td>

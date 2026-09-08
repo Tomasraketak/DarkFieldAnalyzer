@@ -45,6 +45,7 @@ import numpy as np
 
 from frameio import (
     FrameReadError,
+    FrameShapeError,
     build_time_axis,
     load_frame,
     parse_timestamp_from_filename,
@@ -57,6 +58,9 @@ MOMENT_PIXEL_LIMIT = 6_000_000
 
 #: Cílová výška obrazu pro automatickou volbu binningu.
 AUTO_BINNING_TARGET_HEIGHT = 1200
+
+#: Kolik souborů na začátku série se prohlédne, než se určí rozlišení měření.
+SHAPE_PROBE_COUNT = 8
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +115,8 @@ class BiasModel:
     binning: int
     full_scale: float
     source_shape: Tuple[int, int]  # rozměr původního (nebinovaného) snímku
+    frame_paths: List[str] = field(default_factory=list)     # soubory tvořící bias
+    rejected_paths: List[Tuple[str, str]] = field(default_factory=list)  # (cesta, důvod)
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -272,19 +278,41 @@ def compute_bias(
     if full_scale is None:
         full_scale = probe_full_scale(image_paths, sample=min(3, n))
 
-    first = load_frame(image_paths[0], full_scale=full_scale)
-    source_shape = first.data.shape
-    binning = params.resolve_binning(source_shape[0])
-
-    prepared = [apply_geometry(first.data, binning, params.roi)]
-    for path in image_paths[1:n]:
+    # Rozlišení série se určí hlasováním z několika prvních souborů, ne podle
+    # prvního v pořadí. Kdyby se do složky dostal cizí obrázek (typicky
+    # exportovaný graf, který se řadí abecedně před snímky), stal by se jinak
+    # referenčním biasem pro celé měření.
+    candidates: List[Tuple[str, np.ndarray]] = []
+    rejected: List[Tuple[str, str]] = []
+    for path in image_paths[: max(n, SHAPE_PROBE_COUNT)]:
         try:
             frame = load_frame(path, full_scale=full_scale)
-        except FrameReadError:
+        except FrameReadError as exc:
+            rejected.append((path, str(exc)))
             continue
-        if frame.data.shape != source_shape:
-            continue
-        prepared.append(apply_geometry(frame.data, binning, params.roi))
+        candidates.append((path, frame.data))
+
+    if not candidates:
+        raise ValueError("Ze začátku série se nepodařilo načíst žádný snímek.")
+
+    shape_counts: Dict[Tuple[int, int], int] = {}
+    for _path, data in candidates:
+        shape_counts[data.shape] = shape_counts.get(data.shape, 0) + 1
+    # Nejčastější rozlišení; při shodě vyhraje to, které se objevilo dřív.
+    source_shape = max(shape_counts, key=lambda shape: shape_counts[shape])
+
+    for path, data in candidates:
+        if data.shape != source_shape:
+            rejected.append((
+                path,
+                f"rozlišení {data.shape[1]}×{data.shape[0]} px neodpovídá sérii "
+                f"({source_shape[1]}×{source_shape[0]} px)",
+            ))
+
+    binning = params.resolve_binning(source_shape[0])
+    usable = [(path, data) for path, data in candidates if data.shape == source_shape][:n]
+    prepared = [apply_geometry(data, binning, params.roi) for _path, data in usable]
+    bias_paths = [path for path, _data in usable]
 
     if len(prepared) == 1:
         bias = prepared[0]
@@ -303,6 +331,8 @@ def compute_bias(
         binning=binning,
         full_scale=float(full_scale),
         source_shape=source_shape,
+        frame_paths=bias_paths,
+        rejected_paths=rejected,
     )
 
 
@@ -722,6 +752,13 @@ def analyze_frame_file(
 ) -> Tuple[FrameMetrics, Optional[Dict[str, np.ndarray]]]:
     """Načte snímek ze souboru a zanalyzuje ho."""
     frame = load_frame(path, full_scale=bias.full_scale)
+    if frame.data.shape != bias.source_shape:
+        # Druhá pojistka proti cizím obrázkům ve složce (exportované grafy,
+        # náhledy, snímky z jiného měření): rozměr musí sedět na zbytek série.
+        raise FrameShapeError(
+            f"rozlišení {frame.data.shape[1]}×{frame.data.shape[0]} px neodpovídá sérii "
+            f"({bias.source_shape[1]}×{bias.source_shape[0]} px)"
+        )
     prepared = apply_geometry(frame.data, bias.binning, params.roi)
     return analyze_prepared_frame(
         image=prepared,
@@ -958,6 +995,17 @@ def analyze_series(
             f"Pro bias bylo použito jen {bias.frames_used} z požadovaných {params.bias_frames} snímků."
         )
 
+    # Soubory, které do měření nepatří (jiné rozlišení – typicky exportovaný graf
+    # nebo snímek z jiné série), se vyřadí ještě před sestavením časové osy.
+    # Kdyby v seznamu zůstaly, rozhodí razítka i číslování bias snímků.
+    rejected = dict(bias.rejected_paths)
+    if rejected:
+        result.failed_files.extend(bias.rejected_paths)
+        paths = [path for path in paths if path not in rejected]
+        if not paths:
+            result.warnings.append("Po vyřazení cizích souborů nezbyl žádný snímek k analýze.")
+            return result
+
     timestamps, synthetic = build_time_axis(paths, assumed_fps=params.assumed_fps)
     result.synthetic_time_axis = synthetic
     if synthetic:
@@ -967,8 +1015,14 @@ def analyze_series(
         )
     t0 = timestamps[0] if timestamps else datetime.now()
 
-    start_index = bias.frames_used if params.exclude_bias_from_series else 0
-    work = [(i, paths[i], timestamps[i]) for i in range(start_index, len(paths))]
+    # Bias snímky se poznají podle cesty, ne podle pořadí – v seznamu totiž
+    # nemusí být první, pokud se před ně abecedně vloudil jiný soubor.
+    bias_paths = set(bias.frame_paths)
+    work = [
+        (i, paths[i], timestamps[i])
+        for i in range(len(paths))
+        if not (params.exclude_bias_from_series and paths[i] in bias_paths)
+    ]
 
     frame_megapixels = float(bias.data.size) / 1e6
     workers = min(resolve_workers(params, frame_megapixels), max(1, len(work)))
@@ -989,7 +1043,7 @@ def analyze_series(
                 t0=t0,
                 generate_masks=False,
             )
-            if idx < bias.frames_used:
+            if path in bias_paths:
                 metrics.is_bias_frame = True
                 metrics.note = "bias"
             return idx, metrics, None
@@ -1043,8 +1097,16 @@ def analyze_series(
 
     if result.failed_files:
         count = len(result.failed_files)
-        noun = "snímek" if count == 1 else ("snímky" if count < 5 else "snímků")
-        result.warnings.append(f"Nepodařilo se zpracovat {count} {noun} (viz seznam chyb).")
+        if count == 1:
+            phrase = "1 soubor nebyl zahrnut"
+        elif count < 5:
+            phrase = f"{count} soubory nebyly zahrnuty"
+        else:
+            phrase = f"{count} souborů nebylo zahrnuto"
+        result.warnings.append(
+            f"{phrase} do analýzy – nečitelný soubor nebo jiné rozlišení "
+            "než zbytek série (viz seznam chyb)."
+        )
     return result
 
 

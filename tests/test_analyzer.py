@@ -295,7 +295,8 @@ def test_corrupted_file_does_not_stop_series(tmp_path):
     result = analyze_series(list_image_files(str(folder)), AnalysisParams(bias_frames=2, binning=1))
     assert len(result.metrics) == 4        # 6 snímků minus 2 bias (ty se ve výchozím stavu vynechávají)
     assert len(result.failed_files) == 1
-    assert any("nepodařilo" in w.lower() for w in result.warnings)
+    assert os.path.basename(result.failed_files[0][0]) == os.path.basename(broken)
+    assert result.warnings
 
 
 # ---------------------------------------------------------------------------
@@ -499,3 +500,79 @@ def test_haze_only_is_zero_without_haze():
     metrics, _ = analyze(make_frame(dots=[(60, 60), (150, 90)]))
     assert metrics.haze_only_coverage_pct == pytest.approx(0.0, abs=1e-6)
     assert metrics.point_area_pct > 0
+
+
+# ---------------------------------------------------------------------------
+# Pojistky proti cizím souborům ve složce
+# ---------------------------------------------------------------------------
+
+def test_exported_charts_are_not_treated_as_frames(tmp_path):
+    """Regrese: exportované grafy uložené ve složce se braly jako snímky.
+
+    Řadí se abecedně před ``df_00001_…``, takže se z nich stal dokonce
+    referenční bias a celá analýza se počítala proti obrázku grafu.
+    """
+    folder = tmp_path / "mereni"
+    frames = [make_frame(dots=[(50, 50), (150, 100)], noise=1.5, seed=i) for i in range(6)]
+    paths = write_series(str(folder), frames)
+
+    chart = np.full((900, 1200), 240, dtype=np.uint8)      # „graf“ jiného rozměru
+    imwrite_unicode(str(folder / "analyza_mereni_grafy.png"), chart)
+    imwrite_unicode(str(folder / "df_00003_nahled.png"), chart)
+
+    listed = list_image_files(str(folder))
+    assert listed == paths
+    assert list_measurement_folders(str(tmp_path)) == [(str(folder), len(paths))]
+
+    # bez filtru by se do seznamu dostaly a řadily by se první
+    unfiltered = list_image_files(str(folder), skip_outputs=False)
+    assert len(unfiltered) == len(paths) + 2
+    assert os.path.basename(unfiltered[0]).startswith("analyza_")
+
+
+def test_foreign_image_is_rejected_and_does_not_shift_bias(tmp_path):
+    """Cizí obrázek s nevinným názvem nesmí sérii rozhodit.
+
+    Druhá pojistka je rozlišení: soubor, který neodpovídá zbytku série,
+    se vyřadí ještě před sestavením časové osy, takže nezmění ani bias,
+    ani časy snímků.
+    """
+    clean = tmp_path / "cista"
+    dirty = tmp_path / "spinava"
+    frames = [make_frame(dots=[(50, 50), (150, 100)], noise=1.5, seed=i) for i in range(8)]
+    clean_paths = write_series(str(clean), frames)
+    write_series(str(dirty), frames)
+    # sortuje se před "df_…" a má jiné rozlišení
+    imwrite_unicode(str(dirty / "aaa_screenshot.png"), np.zeros((600, 800), dtype=np.uint8))
+
+    params = AnalysisParams(bias_frames=3, binning=1)
+    reference = analyze_series(clean_paths, params)
+    result = analyze_series(list_image_files(str(dirty)), params)
+
+    assert len(result.metrics) == len(reference.metrics)
+    assert not result.synthetic_time_axis
+    assert [os.path.basename(p) for p in result.bias.frame_paths] == [
+        os.path.basename(p) for p in clean_paths[:3]
+    ]
+    assert len(result.failed_files) == 1
+    rejected_path, reason = result.failed_files[0]
+    assert os.path.basename(rejected_path) == "aaa_screenshot.png"
+    assert "rozlišení" in reason
+
+    for expected, actual in zip(reference.metrics, result.metrics):
+        assert actual.filename == expected.filename
+        assert actual.time_s == pytest.approx(expected.time_s)
+        assert actual.total_coverage_pct == pytest.approx(expected.total_coverage_pct)
+
+
+def test_bias_uses_dominant_resolution_even_if_first_file_differs(tmp_path):
+    folder = tmp_path / "hlasovani"
+    frames = [make_frame(dots=[(60, 60)], noise=1.0, seed=i) for i in range(5)]
+    write_series(str(folder), frames)
+    imwrite_unicode(str(folder / "aaa_cizi.png"), np.zeros((100, 120), dtype=np.uint8))
+
+    bias = compute_bias(list_image_files(str(folder)), AnalysisParams(bias_frames=3, binning=1))
+    assert bias.source_shape == SHAPE
+    assert bias.frames_used == 3
+    assert all("aaa_cizi" not in path for path in bias.frame_paths)
+    assert any("aaa_cizi" in path for path, _reason in bias.rejected_paths)

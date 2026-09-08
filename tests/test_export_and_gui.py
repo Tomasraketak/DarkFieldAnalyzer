@@ -302,3 +302,64 @@ def test_default_base_dir_falls_back_when_missing(monkeypatch):
     home = os.path.expanduser("~")
     monkeypatch.setattr(os.path, "isdir", lambda path: path == home)
     assert gui_module.default_base_dir() == home
+
+
+@pytest.mark.parametrize(
+    "screen_w, screen_h",
+    [(1280, 680), (1366, 728), (1536, 824), (1920, 1040)],
+    ids=["FHD@150%", "1366x768", "FHD@125%", "FHD@100%"],
+)
+def test_window_fits_on_screen(app, screen_w, screen_h):
+    """Regrese: pevná velikost 1440×900 byla větší než plocha displeje.
+
+    Na Full HD se škálováním Windows 150 % má plocha jen 1280×720 logických
+    bodů, takže spodní část okna (včetně tlačítka pro spuštění) byla mimo obraz.
+    """
+    from PyQt6.QtCore import QRect
+
+    import gui as gui_module
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    window.settings.remove("window_geometry")
+    window._available_geometry = lambda: QRect(0, 0, screen_w, screen_h)
+    window.restore_geometry()
+
+    assert window.width() <= screen_w
+    assert window.height() <= screen_h
+    # Rozvržení se musí umět zmenšit ještě víc, jinak okno nejde zvětšovat/menšit
+    hint = window.minimumSizeHint()
+    assert hint.width() <= screen_w and hint.height() <= screen_h
+    window.close()
+
+
+def test_window_geometry_is_clamped_to_smaller_screen(app):
+    """Uložená geometrie z většího monitoru se ořízne na aktuální obrazovku."""
+    from PyQt6.QtCore import QRect
+
+    import gui as gui_module
+
+    big = gui_module.DarkfieldAnalyzerGUI()
+    big._available_geometry = lambda: QRect(0, 0, 2560, 1400)
+    big.restore_geometry()
+    big.resize(2400, 1300)
+    big.settings.setValue("window_geometry", big.saveGeometry())
+    big.close()
+
+    small = gui_module.DarkfieldAnalyzerGUI()
+    small._available_geometry = lambda: QRect(0, 0, 1280, 680)
+    small.restore_geometry()
+    assert small.width() <= 1280 and small.height() <= 680
+    small.settings.remove("window_geometry")
+    small.close()
+
+
+def test_left_panel_is_scrollable(app):
+    """Panel s parametry musí jít rolovat, jinak roztáhne okno mimo displej."""
+    import gui as gui_module
+
+    window = gui_module.DarkfieldAnalyzerGUI()
+    left = window.splitter.widget(0)
+    assert isinstance(left, qt.QScrollArea)
+    assert left.widgetResizable()
+    assert left.maximumWidth() <= 520
+    window.close()
