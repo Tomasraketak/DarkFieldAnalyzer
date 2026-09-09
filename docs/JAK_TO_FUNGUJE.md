@@ -15,16 +15,17 @@ skutečného analytického jádra — nejsou to schémata nakreslená ručně.
 2. [Mapa celého řetězce](#2-mapa-celého-řetězce)
 3. [Krok 1 — načtení a normalizace](#3-krok-1--načtení-a-normalizace)
 4. [Krok 2 — geometrie: binning a výřez](#4-krok-2--geometrie-binning-a-výřez)
-5. [Krok 3 — odečet referenčního pozadí](#5-krok-3--odečet-referenčního-pozadí)
-6. [Krok 4 — rozklad na zamlžení a ostrou složku](#6-krok-4--rozklad-na-zamlžení-a-ostrou-složku)
-7. [Krok 5 — odhad šumu a práh (nejdůležitější krok)](#7-krok-5--odhad-šumu-a-práh)
-8. [Krok 6 — segmentace na objekty](#8-krok-6--segmentace-na-objekty)
-9. [Krok 7 — klasifikace typu kontaminace](#9-krok-7--klasifikace-typu-kontaminace)
-10. [Krok 8 — z masek na čísla](#10-krok-8--z-masek-na-čísla)
-11. [Krok 9 — čas: derivace a fáze děje](#11-krok-9--čas-derivace-a-fáze-děje)
-12. [Co která páčka dělá](#12-co-která-páčka-dělá)
-13. [Limity metody — co to neumí](#13-limity-metody--co-to-neumí)
-14. [Jak si to osahat](#14-jak-si-to-osahat)
+5. [Krok 3 — srovnání driftu podle souhvězdí částic](#5-krok-3--srovnání-driftu-podle-souhvězdí-částic)
+6. [Krok 4 — odečet referenčního pozadí](#6-krok-4--odečet-referenčního-pozadí)
+7. [Krok 5 — rozklad na zamlžení a ostrou složku](#7-krok-5--rozklad-na-zamlžení-a-ostrou-složku)
+8. [Krok 6 — odhad šumu a práh (nejdůležitější krok)](#8-krok-6--odhad-šumu-a-práh)
+9. [Krok 7 — segmentace na objekty](#9-krok-7--segmentace-na-objekty)
+10. [Krok 8 — klasifikace typu kontaminace](#10-krok-8--klasifikace-typu-kontaminace)
+11. [Krok 9 — z masek na čísla](#11-krok-9--z-masek-na-čísla)
+12. [Krok 10 — čas: derivace a fáze děje](#12-krok-10--čas-derivace-a-fáze-děje)
+13. [Co která páčka dělá](#13-co-která-páčka-dělá)
+14. [Limity metody — co to neumí](#14-limity-metody--co-to-neumí)
+15. [Jak si to osahat](#15-jak-si-to-osahat)
 
 ---
 
@@ -72,17 +73,18 @@ přibylo.
 | # | Krok | Vstup → výstup | Kde v kódu |
 |---|------|----------------|------------|
 | 1 | Načtení a normalizace | soubor → `float32` v ADU | `frameio.load_frame()` |
-| 2 | Geometrie | plné rozlišení → binning + ROI | `analyzer.apply_geometry()` |
-| 3 | Odečet pozadí | snímek − bias → diference | `analyzer.analyze_prepared_frame()` |
-| 4 | Rozklad | diference → opar + ostrá složka | `analyzer.separate_haze()` |
-| 5 | Odhad šumu a práh | ostrá složka → binární maska | `analyzer.estimate_noise()` |
-| 6 | Segmentace | maska → očíslované objekty | `cv2.connectedComponentsWithStats` |
-| 7 | Klasifikace | objekty → částice / shluk / vlákno | `analyzer.classify_components()` |
-| 8 | Metriky | masky → ~40 čísel | `analyzer.analyze_prepared_frame()` |
-| 9 | Časová řada | čísla → derivace a fáze | `analyzer.compute_rates_and_phases()` |
+| 2 | Geometrie | plné rozlišení → binning | `analyzer.apply_binning()` |
+| 3 | Srovnání driftu | snímek → soustava kotvy + ořez | `alignment.estimate_shift()` |
+| 4 | Odečet pozadí | snímek − bias → diference | `analyzer.analyze_prepared_frame()` |
+| 5 | Rozklad | diference → opar + ostrá složka | `imageops.separate_haze()` |
+| 6 | Odhad šumu a práh | ostrá složka → binární maska | `imageops.estimate_noise()` |
+| 7 | Segmentace | maska → očíslované objekty | `cv2.connectedComponentsWithStats` |
+| 8 | Klasifikace | objekty → částice / shluk / vlákno | `analyzer.classify_components()` |
+| 9 | Metriky | masky → ~40 čísel | `analyzer.analyze_prepared_frame()` |
+| 10 | Časová řada | čísla → derivace a fáze | `analyzer.compute_rates_and_phases()` |
 
-Kroky 1–8 běží pro každý snímek zvlášť a jsou nezávislé — proto se dají pustit
-paralelně. Krok 9 potřebuje celou sérii najednou.
+Kroky 1–9 běží pro každý snímek zvlášť a jsou nezávislé — proto se dají pustit
+paralelně. Krok 10 potřebuje celou sérii najednou.
 
 ---
 
@@ -112,7 +114,7 @@ Dvě věci, které tu stojí za povšimnutí:
 * Výsledek je **`float32`, ne `uint8`.** To je zásadní. V celočíselné aritmetice
   by `snímek − bias` u tmavších míst spadlo na nulu (saturace) a přišli bychom
   o zápornou půlku rozdělení — a přesně z ní se odhaduje šum. Podrobněji
-  v [kroku 5](#7-krok-5--odhad-šumu-a-práh).
+  v [kroku 6](#8-krok-6--odhad-šumu-a-práh).
 * `full_scale` se dá předat zvenčí. Při analýze série se zjistí jednou z prvních
   snímků a pak se používá pro všechny, takže se stupnice uprostřed měření
   nezmění.
@@ -169,16 +171,19 @@ Ostatní režimy mají smysl, když víte, co děláte:
 ## 4. Krok 2 — geometrie: binning a výřez
 
 ```python
-def apply_geometry(image: np.ndarray, binning: int, roi: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
-    """Aplikuje binning (INTER_AREA) a ořez ROI na float32 snímek."""
-    out = image
-    if binning > 1:
-        h, w = out.shape[:2]
-        new_w = max(1, w // binning)
-        new_h = max(1, h // binning)
-        out = cv2.resize(out, (new_w, new_h), interpolation=cv2.INTER_AREA)
+def apply_binning(image: np.ndarray, binning: int) -> np.ndarray:
+    """Zmenší obraz průměrováním bloků ``binning × binning`` (INTER_AREA)."""
+    if binning <= 1:
+        return image
+    h, w = image.shape[:2]
+    return cv2.resize(image, (max(1, w // binning), max(1, h // binning)),
+                      interpolation=cv2.INTER_AREA)
 ```
-<sub>`analyzer.py`, funkce `apply_geometry()`</sub>
+<sub>`analyzer.py`, funkce `apply_binning()`</sub>
+
+Pořadí kroků v `apply_geometry()` je závazné: **binning → srovnání driftu →
+ořez**. Srovnání musí proběhnout nad celým obrazem (jinak by se do výřezu
+natáhl neplatný okraj) a ořez až po něm (protože právě on ten okraj odřízne).
 
 **Binning** je průměrování bloků 2×2 nebo 4×4 pixelů (`INTER_AREA` dělá přesně
 to). Není to jen zrychlení — je to i **zlepšení poměru signál/šum**. Průměrem
@@ -196,7 +201,201 @@ u 4K se ve výchozím stavu použije 2×2, u Full HD nic.
 
 ---
 
-## 5. Krok 3 — odečet referenčního pozadí
+## 5. Krok 3 — srovnání driftu podle souhvězdí částic
+
+Během dlouhého měření se sklíčko nebo kamera posune. Zdá se to jako maličkost —
+pár mikrometrů, pár pixelů — ale pro měření je to **největší jednotlivý zdroj
+chyby**, jaký v tomhle řetězci existuje.
+
+![Drift sklíčka](img/05_drift.png)
+
+### Proč tak malý posun tolik uškodí
+
+Referenční pozadí obsahuje **statické částice**: prach, který na sklíčku leží od
+začátku. V odečtu `snímek − bias` se mají navzájem vyrušit. Když se scéna
+posune, přestanou se krýt a místo nuly po každé z nich zůstane **dipól** —
+kladný půlměsíc tam, kde částice je teď, a záporný tam, kde byla v referenci.
+Kladná půlka projde prahem a analýza ji započítá jako *novou* kontaminaci.
+
+Prostřední panel obrázku výše je přesně tohle: `|snímek − reference|` po posunu
+o 8,6 px. Nesvítí tam nová kontaminace — svítí tam obrys celého sklíčka.
+
+Graf dole ukazuje, jak rychle to eskaluje. Na scéně, kde skutečně přibylo
+**10 částic**:
+
+| drift | bez zarovnání | se zarovnáním |
+|-------|---------------|---------------|
+| 0 px | 10 | 10 |
+| 0,6 px | **259** | 28 |
+| 1,2 px | **529** | 25 |
+| 2,4 px | **648** | 20 |
+| 9,8 px | **339** | 22 |
+
+Chyba je maximální kolem 2 px (tam se dipóly nejlépe rozdělí na dva samostatné
+objekty) a při větším driftu zase mírně klesá, protože se části scény vysunou
+mimo pole. **Už půl pixelu posunu tedy stačí, aby výsledek přestal dávat smysl.**
+
+### Jak se posun měří
+
+Prach usazený na sklíčku se chová jako hvězdné pole: je ho dost, je jasný, drží
+pevnou vzájemnou polohu a s posunem se hýbe celý najednou. Postup je proto
+převzatý z astrometrie.
+
+**1. Detekce hvězd.** Na snímku bez nízkofrekvenčního pozadí (stejná
+`separate_haze()` jako v kroku 5) se prahne na 6 σ — vyšší práh než u vlastní
+analýzy, protože pro zarovnání chceme jen jednoznačné částice. Z každé
+komponenty se spočítá **těžiště vážené jasem**, tedy s přesností na desetiny
+pixelu. Nechá se 100 nejjasnějších.
+
+**2. Hlasování o posunu.** Tohle je jádro věci:
+
+```python
+    dx = other.points[:, None, 0] - anchor.points[None, :, 0]
+    dy = other.points[:, None, 1] - anchor.points[None, :, 1]
+    inside = (np.abs(dx) <= max_shift) & (np.abs(dy) <= max_shift)
+    if not inside.any():
+        return FrameShift(reason=f"žádná dvojice částic do vzdálenosti {max_shift} px")
+
+    votes_x = dx[inside]
+    votes_y = dy[inside]
+    bins = 2 * int(max_shift) + 1
+    span = (-max_shift - 0.5, max_shift + 0.5)
+    hist, _xe, _ye = np.histogram2d(votes_x, votes_y, bins=bins, range=(span, span))
+    peak = np.unravel_index(int(np.argmax(hist)), hist.shape)
+```
+<sub>`alignment.py`, funkce `estimate_shift()`</sub>
+
+Pro **každou dvojici** (hvězda v kotvě, hvězda ve snímku) se hlasuje pro jejich
+rozdíl. Skutečný posun dostane tolik hlasů, kolik je společných hvězd — všechny
+se totiž posunuly stejně. Náhodné dvojice se rozptýlí po celém histogramu.
+Při 100 hvězdách je to 10 000 dvojic, jedna operace v NumPy.
+
+Proč hlasování a ne prosté „najdi nejbližší hvězdu“: to funguje jen tehdy, když
+je posun menší než typická vzdálenost mezi částicemi. Hlasování zvládne posun
+libovolně velký (do zadané meze) a nevadí mu, že část hvězd mezitím přibyla
+nebo zmizela.
+
+**3. Zpřesnění.** Po hrubém posunu se ke každé hvězdě kotvy přiřadí nejbližší
+hvězda snímku a výsledek se spočítá jako **medián** přes tyto páry — medián,
+protože pár špatně spárovaných hvězd nesmí odhad utáhnout. Z týchž párů se
+volitelně určí i pootočení (Umeyama bez změny měřítka).
+
+Naměřená přesnost na scéně se známým posunem: **lepší než 0,1 px** pro posuny
+od 0 do 31 px.
+
+### Pojistka proti horkým pixelům
+
+Vadné pixely senzoru vypadají jako velmi jasné hvězdy, ale **nepohybují se se
+scénou** — jsou pevné vůči kameře. V hlasování by proto všechny svorně hlasovaly
+pro nulový posun.
+
+Není to teoretická obava. Změřeno na scéně s 20 skutečnými částicemi a 60 vadnými
+pixely, skutečný posun (+8,0; −5,0) px:
+
+| detekce | výsledek |
+|---------|----------|
+| bez pojistek | **(+0,00; +0,00)** — vadné pixely přehlasovaly částice |
+| s pojistkami | (+7,99; −4,99) |
+
+Brání se jim dvakrát. **Tvarem:**
+
+```python
+    haze, _small = separate_haze(data)
+    excess = cv2.subtract(data, haze)              # jas nad lokálním pozadím
+    neighbour_max = cv2.dilate(excess, _NEIGHBOUR_KERNEL)
+
+    _median, sigma = estimate_noise(excess)
+    bright = excess > max(sigma_mult * sigma, 1.0)
+    isolated = neighbour_max < neighbour_ratio * excess
+    return bright & isolated
+```
+<sub>`alignment.py`, funkce `find_hot_pixels()`</sub>
+
+Kritérium je **poměrové, ne absolutní**. Vadný pixel svítí sám za sebe a jeho
+sousedé jsou na úrovni pozadí, takže poměr `soused / střed` je blízký nule.
+Skutečná částice je rozmazaná optikou: i ta nejostřejší, jakou přístroj dokáže
+zobrazit (Gaussova stopa σ ≈ 1 px), má souseda na `exp(−½) ≈ 0,61` své výšky.
+Mez 0,35 leží bezpečně mezi tím.
+
+Absolutní práh („pixel je o 8 σ jasnější než soused“) by nestačil — ostrá
+částice o jasu 190 ADU má souseda o 27 ADU níž, což je při σ ≈ 1 ADU hluboko
+nad prahem, a částice by se označila za vadný pixel. Na tohle existuje test.
+
+**Polohou:** nalezené vadné pixely se z hledání hvězd vyloučí. Navíc se
+**opravují** (nahradí se mediánem okolí) — a to ještě *před* srovnáním, tedy
+v soustavě senzoru. Kdyby se neopravily, po srovnání by se posunuly spolu se
+zbytkem snímku, s referencí by se přestaly krýt a zůstala by po každém dvojice
+světlý/tmavý bod. Vadný pixel není kontaminace, takže jeho odstraněním se
+o nic naměřeného nepřichází.
+
+### Volba interpolace není kosmetika
+
+Srovnání je subpixelové, takže se snímek musí interpolovat. Interpolace ale
+obraz rozmazává — a srovnaný snímek se pak porovnává s referencí, která
+interpolací neprošla. Rozmazání se proto projeví jako světlý prstenec kolem
+každé statické částice, tedy jako falešná kontaminace.
+
+Změřeno na poli 120 částic posunutém o (9,02; −6,53) px:
+
+| srovnání | falešných detekcí |
+|----------|-------------------|
+| žádné (drift zůstane) | 110 |
+| nejbližší soused | 112 |
+| bilineární | 37 |
+| bikubická | 10 |
+| **Lanczos** | **3** |
+
+Nejbližší soused nepomůže vůbec — neumí subpixelový posun. Bilineární
+interpolace je dvoubodová a chová se jako dolní propust. Lanczosovo jádro (8×8)
+zachovává spektrum obrazu nejlépe, proto se používá i za cenu vyšší náročnosti
+(asi 47 ms na snímek 1920×1080).
+
+### Ořez okraje
+
+Po srovnání chybí u každého snímku pruh na té straně, odkud se posunul. Kdyby
+tam analýza měřila, počítala by prázdnou plochu. Ořezává se proto **stejným
+podílem v obou osách**, aby výřez měl stejný poměr stran jako originál:
+
+```python
+    fraction = min(max(float(fraction), MIN_CROP_FRACTION), 1.0)
+    if mode == "fixed":
+        used = fraction
+    else:
+        needed = 2.0 * (abs(float(drift_px)) + float(margin))
+        used = 1.0 - needed / float(min(height, width))
+        used = min(max(used, MIN_CROP_FRACTION), 1.0)
+
+    new_w = max(16, int(round(width * used)))
+    new_h = max(16, int(round(height * used)))
+    x = (width - new_w) // 2
+    y = (height - new_h) // 2
+```
+<sub>`alignment.py`, funkce `safe_crop_rect()`</sub>
+
+Režim **„podle driftu“** (výchozí) ořeže jen tolik, kolik naměřený drift
+vyžaduje, plus 3 px rezervy — u klidného měření to bývají desetiny procenta,
+u driftu 11 px asi 4 %. Režim **„pevných 90 %“** ořeže vždy stejně, takže je
+analyzovaná plocha srovnatelná mezi různými měřeními bez ohledu na to, jak moc
+se který vzorek hýbal.
+
+Velikost driftu se odhaduje předem z **deseti snímků rovnoměrně rozložených po
+sérii**. Drift bývá jednosměrný, takže krajní snímky zachytí jeho maximum.
+
+### Co se srovnává čím
+
+Kotvou je **první snímek série**; k němu se srovnává všechno ostatní. Ne
+k předchozímu snímku — tak by se chyby sčítaly a po tisíci snímcích by z toho
+byl náhodný pochod.
+
+Srovnat se musí i **referenční pozadí**, jinak by celá práce byla k ničemu:
+u externí reference se změří její vlastní posun vůči kotvě a warpne se stejně
+jako snímky. U biasu počítaného ze série se srovnávají jednotlivé bias snímky
+**ještě před mediánem** — jinak by se drift mezi nimi propsal do reference jako
+rozmazání částic.
+
+---
+
+## 6. Krok 4 — odečet referenčního pozadí
 
 Toto je krok, který z „hezkého obrázku“ dělá **měření**.
 
@@ -241,7 +440,13 @@ Reference vznikla dřív, takže se od snímků může lišit konstantním posun
             continue
         if frame.data.shape != bias.source_shape:
             continue
-        prepared = apply_geometry(frame.data, bias.binning, params.roi)
+        binned = apply_binning(frame.data, bias.binning)
+        if alignment is not None and alignment.usable:
+            binned = repair_hot_pixels(binned, alignment.hot_mask)
+            shift = alignment.measure(binned)
+            if shift.ok:
+                binned = warp_to_anchor(binned, shift)
+        prepared = crop_to_roi(binned, params.roi, bias.binning)
         diff = cv2.subtract(prepared, match_shape(bias.data, prepared.shape[:2]))
         _haze_full, haze_small = separate_haze(diff)
         if haze_small.size:
@@ -265,7 +470,7 @@ vyzkoušeno: 14 ADU mlhy přes celé pole vyšlo jako 18 % pokrytí místo 100 %
 
 ---
 
-## 6. Krok 4 — rozklad na zamlžení a ostrou složku
+## 7. Krok 5 — rozklad na zamlžení a ostrou složku
 
 Dechová mlha, kondenzát a zaschlý film mají jinou prostorovou charakteristiku než
 prach: jsou **hladké a rozlehlé**, kdežto částice jsou **malé a ostré**. Rozklad
@@ -284,7 +489,7 @@ podle prostorové frekvence je proto přirozený způsob, jak je oddělit.
     haze_full = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
     return haze_full, small
 ```
-<sub>`analyzer.py`, funkce `separate_haze()`</sub>
+<sub>`imageops.py`, funkce `separate_haze()`</sub>
 
 Čtyři operace, každá má svůj důvod:
 
@@ -311,7 +516,7 @@ z ní vyhlazený.
 
 ---
 
-## 7. Krok 5 — odhad šumu a práh
+## 8. Krok 6 — odhad šumu a práh
 
 **Toto je nejcitlivější místo celé analýzy.** Práh se odvozuje ze šumu, takže
 chybný odhad šumu = chybné všechno.
@@ -345,7 +550,7 @@ selže, a to dvěma opačnými způsoby:
         deltas = (patch[:, 1:] - patch[:, :-1]).ravel()
         sigma = float(np.median(np.abs(deltas - np.median(deltas)))) * 1.4826 / math.sqrt(2.0)
 ```
-<sub>`analyzer.py`, funkce `estimate_noise()`</sub>
+<sub>`imageops.py`, funkce `estimate_noise()`</sub>
 
 Myšlenka: **šum se mění od pixelu k pixelu, scéna ne.** Rozdíl sousedních pixelů
 proto skoro celý pochází ze šumu — struktura scény (i jasná částice) je spojitá
@@ -389,7 +594,7 @@ pozadí, kde by σ vyšlo nesmyslně malé.
 
 ---
 
-## 8. Krok 6 — segmentace na objekty
+## 9. Krok 7 — segmentace na objekty
 
 ```python
     n_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
@@ -412,7 +617,7 @@ jinak by se rozpadlo na řetízek samostatných bodů.
 
 ---
 
-## 9. Krok 7 — klasifikace typu kontaminace
+## 10. Krok 8 — klasifikace typu kontaminace
 
 Máme objekty, teď jim potřebujeme přiřadit typ. Rozhodují **dvě čísla**: plocha
 a protáhlost.
@@ -517,7 +722,7 @@ obarvení celého snímku je jediná indexovací operace:
 
 ---
 
-## 10. Krok 8 — z masek na čísla
+## 11. Krok 9 — z masek na čísla
 
 ### Disjunktní rozklad pokrytí
 
@@ -597,7 +802,7 @@ Když v sérii najednou spadne, výsledkům z toho místa nevěřte.
 
 ---
 
-## 11. Krok 9 — čas: derivace a fáze děje
+## 12. Krok 10 — čas: derivace a fáze děje
 
 ![Časová řada a fáze](img/04_faze.png)
 
@@ -662,7 +867,7 @@ prachu neoznačil nic a u prudkého zapaření dechem naopak úplně všechno.
 
 ---
 
-## 12. Co která páčka dělá
+## 13. Co která páčka dělá
 
 | Parametr | Zvýšení znamená | Kdy sáhnout |
 |----------|-----------------|-------------|
@@ -676,6 +881,8 @@ prachu neoznačil nic a u prudkého zapaření dechem naopak úplně všechno.
 | **Bias snímků** (3) | tišší reference, ale méně snímků ve výsledku | u externí reference se neuplatní |
 | **Binning** | rychlost a SNR nahoru, detail dolů | 4K → 2×2; hledáte nejjemnější prach → plné rozlišení |
 | **Měřítko µm/px** | přepočet na fyzikální jednotky | podle kalibrace objektivu; 0 = jen pixely |
+| **Srovnat drift** (zap) | snímky se srovnají na kotvu | vypněte jen když víte, že se vzorek nehýbe a chcete plnou plochu |
+| **Ořez po srovnání** | podle driftu / pevných 90 % / žádný | „pevných 90 %“ když potřebujete stejnou plochu napříč měřeními |
 
 Nejrychlejší způsob, jak zjistit, jestli je nastavení dobré: **záložka 🖼️ Snímky**.
 Přepněte na „barevná klasifikace“ a porovnejte s originálem. Když barvy sedí na
@@ -683,7 +890,7 @@ to, co vidíte očima, sedí i čísla.
 
 ---
 
-## 13. Limity metody — co to neumí
+## 14. Limity metody — co to neumí
 
 Poctivý výčet toho, kde metoda přestává platit:
 
@@ -711,13 +918,27 @@ Poctivý výčet toho, kde metoda přestává platit:
 * **Plošné zamlžení přes 100 % pole nelze odlišit od posunu jasu.** Když je
   celé pole rovnoměrně zamlžené, je to matematicky totéž jako jinak nastavená
   expozice. Pomůže jen reference pořízená těsně předtím.
+* **Zarovnání předpokládá, že se hýbe většina toho, co je vidět.** Hlasování
+  vybírá nejčastější posun. Když by většinu výrazných struktur ve snímku tvořil
+  prach na senzoru nebo na optice (tedy něco, co se s driftem sklíčka nehýbe),
+  vyhrálo by hlasování „scéna se nehnula“. U měření witness sklíčka je drtivá
+  většina viditelných částic na sklíčku, takže to platí — ale u silně
+  znečištěné optiky ne. Poznáte to podle sloupce *Drift – spárovaných částic*
+  v CSV: když je vysoký a drift přesto vychází nulový přes celé měření, stojí
+  za to optiku zkontrolovat.
+* **Srovnání samo o sobě zbytkovou chybu nechává.** Interpolace nechá kolem
+  statických částic drobné zbytky (viz tabulka výše: 3 detekce ze 120 částic).
+  Je to o dva řády lepší než drift bez srovnání, ale ne nula.
+* **Rotace se odhaduje jen hrubě.** Odhad se použije až od 12 spárovaných
+  částic a nad 5° se zahodí jako nedůvěryhodný. Metoda je stavěná na posuv,
+  ne na otáčivý stolek.
 * **Metoda nepozná, co se změnilo mezi referencí a měřením** kromě sklíčka.
   Když se mezitím sáhne na ostření nebo na osvětlení, výsledky nejsou srovnatelné.
   Proto se hlásí odstup reference nad 6 hodin.
 
 ---
 
-## 14. Jak si to osahat
+## 15. Jak si to osahat
 
 Analytické jádro je bez závislosti na GUI, takže se dá volat přímo. Tenhle skript
 projde jeden snímek a vypíše, co se v každém kroku stalo:
@@ -792,6 +1013,8 @@ py -m pytest tests\test_reference.py -q -k level -v    # srovnání úrovně ref
 | Chci rozumět… | Otevřete |
 |---------------|----------|
 | načítání, bitové hloubce, barvám | `frameio.py` |
+| srovnání driftu a souhvězdí částic | `alignment.py` |
+| odhadu šumu a separaci oparu | `imageops.py` |
 | výběru reference podle času | `reference.py` |
 | celé analýze jednoho snímku | `analyzer.py`, `analyze_prepared_frame()` |
 | paralelnímu zpracování série | `analyzer.py`, `analyze_series()` |

@@ -36,13 +36,30 @@ import os
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
+from alignment import (
+    AlignmentError,
+    AlignmentModel,
+    DEFAULT_MAX_SHIFT,
+    DEFAULT_MIN_MATCHES,
+    DEFAULT_STAR_COUNT,
+    DEFAULT_STAR_SIGMA,
+    FrameShift,
+    detect_stars,
+    estimate_shift,
+    find_hot_pixels,
+    repair_hot_pixels,
+    intersect_roi,
+    safe_crop_rect,
+    warp_to_anchor,
+)
+from imageops import estimate_noise, separate_haze
 from frameio import (
     DEFAULT_MONO_MODE,
     FrameReadError,
@@ -125,6 +142,16 @@ class AnalysisParams:
 
     # --- barevné snímky ----------------------------------------------------
     mono_mode: str = DEFAULT_MONO_MODE     # Převod barvy na intenzitu (viz frameio.MONO_MODES)
+
+    # --- zarovnání snímků (drift sklíčka nebo kamery) ----------------------
+    align_frames: bool = True              # Srovnat snímky podle souhvězdí částic
+    align_star_count: int = DEFAULT_STAR_COUNT      # Kolik částic tvoří souhvězdí
+    align_star_sigma: float = DEFAULT_STAR_SIGMA    # Práh detekce částice [× σ]
+    align_max_shift_px: int = DEFAULT_MAX_SHIFT     # Největší uvažovaný posun [px]
+    align_min_matches: int = DEFAULT_MIN_MATCHES    # Minimum spárovaných částic
+    align_crop_mode: str = "auto"          # "auto" (podle driftu) | "fixed" | "none"
+    align_crop_fraction: float = 0.90      # Podíl plochy při "fixed"
+    align_rotation: bool = True            # Odhadovat i pootočení scény
 
     def resolve_binning(self, image_height: int) -> int:
         """Vrátí skutečný binning – při ``binning=0`` ho odvodí z rozlišení."""
@@ -260,6 +287,14 @@ class FrameMetrics:
     #: U biasu počítaného ze série je vždy 0.
     reference_offset_adu: float = 0.0
 
+    #: Naměřený drift snímku vůči kotvě (v px plného rozlišení) a jeho kvalita.
+    align_dx_px: float = 0.0
+    align_dy_px: float = 0.0
+    align_rotation_deg: float = 0.0
+    align_stars: int = 0
+    align_rms_px: float = 0.0
+    align_ok: bool = False
+
     # Dopočítává se přes celou sérii
     rate_coverage_pct_per_s: float = 0.0
     rate_haze_pct_per_s: float = 0.0
@@ -284,6 +319,9 @@ class SeriesResult:
     synthetic_time_axis: bool = False
     cancelled: bool = False
 
+    #: Model zarovnání driftu (``None`` = snímky se nesrovnávaly).
+    alignment: Optional[AlignmentModel] = None
+
     #: Zvolená externí reference (``None`` = bias se počítal ze série).
     reference: Optional[ReferenceRecord] = None
     reference_dir: Optional[str] = None
@@ -298,27 +336,48 @@ class SeriesResult:
 # Geometrie: binning, ROI, sladění biasu
 # ---------------------------------------------------------------------------
 
-def apply_geometry(image: np.ndarray, binning: int, roi: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
-    """Aplikuje binning (INTER_AREA) a ořez ROI na float32 snímek."""
-    out = image
+def apply_binning(image: np.ndarray, binning: int) -> np.ndarray:
+    """Zmenší obraz průměrováním bloků ``binning × binning`` (INTER_AREA)."""
+    if binning <= 1:
+        return image
+    h, w = image.shape[:2]
+    return cv2.resize(image, (max(1, w // binning), max(1, h // binning)),
+                      interpolation=cv2.INTER_AREA)
+
+
+def crop_to_roi(image: np.ndarray, roi: Optional[Tuple[int, int, int, int]],
+                binning: int) -> np.ndarray:
+    """Ořízne obraz na ROI zadaný v pixelech **plného rozlišení**."""
+    if roi is None:
+        return np.ascontiguousarray(image, dtype=np.float32)
+
+    rx, ry, rw, rh = (int(v) for v in roi)
     if binning > 1:
-        h, w = out.shape[:2]
-        new_w = max(1, w // binning)
-        new_h = max(1, h // binning)
-        out = cv2.resize(out, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rx, ry, rw, rh = rx // binning, ry // binning, rw // binning, rh // binning
+    h, w = image.shape[:2]
+    rx = max(0, min(rx, w - 1))
+    ry = max(0, min(ry, h - 1))
+    rw = max(1, min(rw, w - rx))
+    rh = max(1, min(rh, h - ry))
+    return np.ascontiguousarray(image[ry : ry + rh, rx : rx + rw], dtype=np.float32)
 
-    if roi is not None:
-        rx, ry, rw, rh = (int(v) for v in roi)
-        if binning > 1:
-            rx, ry, rw, rh = rx // binning, ry // binning, rw // binning, rh // binning
-        h, w = out.shape[:2]
-        rx = max(0, min(rx, w - 1))
-        ry = max(0, min(ry, h - 1))
-        rw = max(1, min(rw, w - rx))
-        rh = max(1, min(rh, h - ry))
-        out = out[ry : ry + rh, rx : rx + rw]
 
-    return np.ascontiguousarray(out, dtype=np.float32)
+def apply_geometry(
+    image: np.ndarray,
+    binning: int,
+    roi: Optional[Tuple[int, int, int, int]],
+    shift: Optional[FrameShift] = None,
+) -> np.ndarray:
+    """Aplikuje binning, volitelné srovnání driftu a ořez ROI na float32 snímek.
+
+    Pořadí je závazné: **binning → srovnání → ořez**. Srovnání musí proběhnout
+    nad celým (neořezaným) obrazem, jinak by se do výřezu natáhl neplatný okraj;
+    ořez naopak až po srovnání, protože právě on ten neplatný okraj odřízne.
+    """
+    out = apply_binning(image, binning)
+    if shift is not None:
+        out = warp_to_anchor(out, shift)
+    return crop_to_roi(out, roi, binning)
 
 
 def match_shape(reference: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
@@ -396,6 +455,125 @@ def probe_series_shape(
 
 
 # ---------------------------------------------------------------------------
+# Zarovnání série (drift sklíčka nebo kamery)
+# ---------------------------------------------------------------------------
+
+#: Kolik snímků rovnoměrně po sérii se prohlédne při odhadu celkového driftu.
+ALIGN_PROBE_FRAMES = 10
+
+
+def _load_binned(path: str, params: AnalysisParams, full_scale: float, binning: int) -> np.ndarray:
+    """Načte snímek a zmenší ho do geometrie analýzy (bez ořezu)."""
+    frame = load_frame(path, full_scale=full_scale, mono_mode=params.mono_mode)
+    return apply_binning(frame.data, binning)
+
+
+def build_alignment(
+    image_paths: Sequence[str],
+    params: AnalysisParams,
+    source_shape: Tuple[int, int],
+    full_scale: float,
+    probe_frames: int = ALIGN_PROBE_FRAMES,
+) -> Optional[AlignmentModel]:
+    """Sestaví model zarovnání: kotvu, masku horkých pixelů a bezpečný ořez.
+
+    Kotvou je **první snímek série** – k němu se srovnává všechno ostatní,
+    takže se chyby nesčítají tak, jako kdyby se každý snímek srovnával
+    k předchozímu.
+
+    Velikost ořezu se odvozuje z driftu naměřeného na vzorku snímků rozložených
+    po celé sérii. Drift bývá jednosměrný, takže krajní snímky zachytí jeho
+    maximum; k naměřené hodnotě se ještě přidává rezerva.
+    """
+    paths = list(image_paths)
+    if not params.align_frames or not paths:
+        return None
+
+    binning = params.resolve_binning(source_shape[0])
+    try:
+        anchor_image = _load_binned(paths[0], params, full_scale, binning)
+    except FrameReadError as exc:
+        raise AlignmentError(f"Kotevní snímek nelze načíst: {exc}") from exc
+
+    # Horké pixely se hledají v samotné kotvě: je to test ostrosti jednotlivého
+    # bodu, žádnou další referenci k tomu není potřeba.
+    hot_mask = find_hot_pixels(anchor_image)
+    anchor_image = repair_hot_pixels(anchor_image, hot_mask)
+    anchor_stars = detect_stars(
+        anchor_image, hot_mask=hot_mask,
+        star_count=params.align_star_count, sigma=params.align_star_sigma,
+    )
+
+    model = AlignmentModel(
+        anchor=anchor_stars,
+        anchor_path=paths[0],
+        binning=binning,
+        max_shift_px=int(params.align_max_shift_px),
+        min_matches=int(params.align_min_matches),
+        star_count=int(params.align_star_count),
+        star_sigma=float(params.align_star_sigma),
+        hot_mask=hot_mask,
+        hot_pixel_count=int(hot_mask.sum()) if hot_mask is not None else 0,
+        estimate_rotation=bool(params.align_rotation),
+    )
+
+    if anchor_stars.count < params.align_min_matches:
+        model.notes.append(
+            f"Na prvním snímku se našlo jen {anchor_stars.count} zřetelných částic "
+            f"(potřeba {params.align_min_matches}) – zarovnání se nepoužije."
+        )
+        model.usable = False
+        return model
+
+    # --- drift na vzorku snímků -------------------------------------------
+    picks = _spread_sample(paths, probe_frames)
+    for path in picks:
+        if path == paths[0]:
+            model.sampled.append((path, FrameShift(matched=anchor_stars.count, ok=True)))
+            continue
+        try:
+            binned = _load_binned(path, params, full_scale, binning)
+        except FrameReadError:
+            continue
+        if binned.shape != anchor_image.shape:
+            continue
+        model.sampled.append((path, model.measure(repair_hot_pixels(binned, hot_mask))))
+
+    # Když se nepodařilo srovnat ani jeden ze vzorkovaných snímků, nemá smysl
+    # nic ořezávat ani zdržovat analýzu měřením u každého snímku – souhvězdí
+    # v téhle sérii prostě není (prázdné sklíčko, málo výrazných částic).
+    others = [shift for path, shift in model.sampled if path != paths[0]]
+    if others and not any(shift.ok for shift in others):
+        reason = next((s.reason for s in others if s.reason), "částice se nepodařilo spárovat")
+        model.notes.append(
+            f"Snímky nejde zarovnat podle souhvězdí částic ({reason}) – "
+            "zarovnání se nepoužije."
+        )
+        model.usable = False
+        return model
+
+    drift = model.sampled_drift_px
+    mode = (params.align_crop_mode or "auto").strip().lower()
+    if mode in ("none", "zadny", "žádný", "vypnuto"):
+        model.crop, model.crop_fraction = None, 1.0
+    else:
+        model.crop, model.crop_fraction = safe_crop_rect(
+            source_shape, drift_px=drift, mode=mode, fraction=params.align_crop_fraction,
+        )
+    return model
+
+
+def _spread_sample(paths: Sequence[str], count: int) -> List[str]:
+    """Vybere ``count`` souborů rovnoměrně rozložených po sérii (včetně krajních)."""
+    items = list(paths)
+    count = max(1, min(int(count), len(items)))
+    if count == 1:
+        return [items[0]]
+    step = (len(items) - 1) / float(count - 1)
+    return [items[int(round(i * step))] for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
 # Bias
 # ---------------------------------------------------------------------------
 
@@ -403,6 +581,7 @@ def compute_bias(
     image_paths: Sequence[str],
     params: AnalysisParams,
     full_scale: Optional[float] = None,
+    alignment: Optional[AlignmentModel] = None,
 ) -> BiasModel:
     """Sestaví master bias z prvních N snímků.
 
@@ -425,7 +604,18 @@ def compute_bias(
     rejected = list(probe.rejected)
     binning = params.resolve_binning(source_shape[0])
     usable = probe.frames[:n]
-    prepared = [apply_geometry(data, binning, params.roi) for _path, data in usable]
+
+    # Bias snímky se srovnávají na kotvu ještě před mediánem – jinak by se
+    # drift mezi nimi propsal do reference jako rozmazání částic.
+    prepared = []
+    for _path, data in usable:
+        binned = apply_binning(data, binning)
+        if alignment is not None and alignment.usable:
+            binned = repair_hot_pixels(binned, alignment.hot_mask)
+            shift = alignment.measure(binned)
+            if shift.ok:
+                binned = warp_to_anchor(binned, shift)
+        prepared.append(crop_to_roi(binned, params.roi, binning))
     bias_paths = [path for path, _data in usable]
 
     if len(prepared) == 1:
@@ -460,6 +650,7 @@ def bias_from_reference(
     source_shape: Tuple[int, int],
     full_scale: float = 255.0,
     rejected_paths: Optional[Sequence[Tuple[str, str]]] = None,
+    alignment: Optional[AlignmentModel] = None,
 ) -> BiasModel:
     """Postaví :class:`BiasModel` z uložené reference.
 
@@ -482,7 +673,18 @@ def bias_from_reference(
         )
 
     binning = params.resolve_binning(source_shape[0])
-    data = apply_geometry(reference, binning, params.roi)
+    binned = apply_binning(reference, binning)
+
+    # Reference vznikla dřív, takže scéna na ní může být posunutá vůči kotvě.
+    # Bez srovnání by se statické částice nekryly a zůstaly by po nich dipóly.
+    bias_shift: Optional[FrameShift] = None
+    if alignment is not None and alignment.usable:
+        binned = repair_hot_pixels(binned, alignment.hot_mask)
+        bias_shift = alignment.measure(binned)
+        if bias_shift.ok:
+            binned = warp_to_anchor(binned, bias_shift)
+        alignment.bias_shift = bias_shift
+    data = crop_to_roi(binned, params.roi, binning)
 
     return BiasModel(
         data=np.ascontiguousarray(data, dtype=np.float32),
@@ -504,6 +706,7 @@ def estimate_reference_offset(
     bias: BiasModel,
     params: AnalysisParams,
     samples: int = REFERENCE_LEVEL_SAMPLES,
+    alignment: Optional[AlignmentModel] = None,
 ) -> float:
     """Odhadne konstantní posun úrovně mezi externí referencí a sérií [ADU].
 
@@ -521,6 +724,11 @@ def estimate_reference_offset(
     Cenou je, že se odečte i kontaminace, která je po celou sérii konstantní.
     Proto se korekce používá jen u externí reference a jen nad mezí
     :data:`REFERENCE_LEVEL_DEADBAND_ADU`.
+
+    Snímky se sem berou **už srovnané na kotvu**. Bez toho by drift sklíčka
+    nechal po každé statické částici dvojici světlý/tmavý půlměsíc, záporné
+    půlky by stáhly nízký percentil hluboko pod nulu a výsledkem by byl
+    několikaADUový „posun úrovně“, který ve skutečnosti neexistuje.
     """
     paths = list(image_paths)
     if not paths:
@@ -541,7 +749,13 @@ def estimate_reference_offset(
             continue
         if frame.data.shape != bias.source_shape:
             continue
-        prepared = apply_geometry(frame.data, bias.binning, params.roi)
+        binned = apply_binning(frame.data, bias.binning)
+        if alignment is not None and alignment.usable:
+            binned = repair_hot_pixels(binned, alignment.hot_mask)
+            shift = alignment.measure(binned)
+            if shift.ok:
+                binned = warp_to_anchor(binned, shift)
+        prepared = crop_to_roi(binned, params.roi, bias.binning)
         diff = cv2.subtract(prepared, match_shape(bias.data, prepared.shape[:2]))
         _haze_full, haze_small = separate_haze(diff)
         if haze_small.size:
@@ -582,86 +796,6 @@ def resolve_reference(
         return ReferenceChoice(record=None, reason="Složka s referencemi je prázdná."), directory
 
     return select_reference(records, series_start_time(image_paths)), directory
-
-
-# ---------------------------------------------------------------------------
-# Statistika pozadí a separace oparu
-# ---------------------------------------------------------------------------
-
-def estimate_noise(image: np.ndarray, sample_limit: int = 250_000) -> Tuple[float, float]:
-    """Robustní odhad (medián, σ) šumu pozadí na podvzorku.
-
-    Šum se odhaduje z **rozdílů sousedních pixelů** (MAD × 1.4826 / √2). Tento
-    vysokofrekvenční odhad má oproti odhadu z celkového rozdělení dvě zásadní
-    výhody:
-
-    * nezkreslí ho struktura scény – kontaminace je prostorově souvislá,
-      zatímco šum se mění od pixelu k pixelu;
-    * funguje i u snímků, které samy vstoupily do výpočtu biasu. U mediánového
-      biasu je u nich přes polovinu pixelů rozdílu přesně nulová, klasický MAD
-      vyjde téměř nulový, práh spadne pod úroveň šumu a analýza „najde“
-      desítky tisíc neexistujících částic.
-
-    Teprve když je i tento odhad degenerovaný (dokonale hladké pozadí), sáhne
-    se po MAD a šířce dolní poloviny rozdělení.
-
-    Odhad se počítá z *neořezané* diference včetně záporné části – původní
-    verze měřila šum až po saturačním odečtu v uint8, kde je polovina
-    rozdělení uříznutá, a šum tím systematicky podhodnocovala.
-    """
-    if image.size == 0:
-        return 0.0, 1.0
-
-    step = max(1, int(math.sqrt(image.size / max(1, sample_limit))))
-    patch = image[::step, ::step].astype(np.float32, copy=False)
-    sample = patch.ravel()
-    if sample.size == 0:
-        return 0.0, 1.0
-
-    median = float(np.median(sample))
-
-    # Primární odhad: rozdíly sousedních pixelů (vysokofrekvenční složka).
-    # Měří skutečný šum senzoru, nikoliv strukturu scény – na reálném snímku
-    # z temného pole je totiž velká část plochy pokrytá texturou (zaschlý film,
-    # rozostřené halo kolem kapek) a odhad z celkového rozdělení by tuto
-    # strukturu započítal jako „šum“, práh by vyletěl a jemné částice by zmizely.
-    sigma = 0.0
-    if patch.ndim == 2 and patch.shape[1] > 1:
-        deltas = (patch[:, 1:] - patch[:, :-1]).ravel()
-        sigma = float(np.median(np.abs(deltas - np.median(deltas)))) * 1.4826 / math.sqrt(2.0)
-
-    if not np.isfinite(sigma) or sigma <= 0.25:
-        # Záložní odhady pro degenerované případy (dokonale hladké pozadí).
-        mad_sigma = float(np.median(np.abs(sample - median))) * 1.4826
-        lower_sigma = median - float(np.percentile(sample, 15.87))
-        sigma = max(mad_sigma, lower_sigma)
-    if not np.isfinite(sigma) or sigma <= 0.25:
-        # Naprosto ploché pozadí (typicky dokonale černé 8bit pole). Nepočítá se
-        # náhradní odhad ze směrodatné odchylky celého snímku – ta zahrnuje i
-        # samotnou kontaminaci a práh by vyšel tak vysoko, že by se nenašlo nic.
-        # Práh v takovém případě určuje mez ``min_threshold_adu``.
-        sigma = 0.25
-    return median, sigma
-
-
-def separate_haze(diff: np.ndarray, downscale: int = 16) -> Tuple[np.ndarray, np.ndarray]:
-    """Rozdělí diferenci na nízkofrekvenční opar a jeho zmenšenou verzi.
-
-    Postup: zmenšení (INTER_AREA) → morfologické otevření (odstraní bodové
-    částice, aby nezvyšovaly odhad oparu) → Gaussovo rozostření → zpět na
-    plné rozlišení. Vrací ``(haze_full, haze_small)``.
-    """
-    h, w = diff.shape[:2]
-    small_w = max(16, w // downscale)
-    small_h = max(16, h // downscale)
-
-    small = cv2.resize(diff, (small_w, small_h), interpolation=cv2.INTER_AREA)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    small = cv2.morphologyEx(small, cv2.MORPH_OPEN, kernel)
-    small = cv2.GaussianBlur(small, (0, 0), sigmaX=2.0, sigmaY=2.0)
-
-    haze_full = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
-    return haze_full, small
 
 
 # ---------------------------------------------------------------------------
@@ -1012,8 +1146,9 @@ def analyze_frame_file(
     timestamp: datetime,
     t0: datetime,
     generate_masks: bool = False,
+    alignment: Optional[AlignmentModel] = None,
 ) -> Tuple[FrameMetrics, Optional[Dict[str, np.ndarray]]]:
-    """Načte snímek ze souboru a zanalyzuje ho."""
+    """Načte snímek ze souboru, srovná ho na kotvu a zanalyzuje."""
     frame = load_frame(path, full_scale=bias.full_scale, mono_mode=params.mono_mode)
     if frame.data.shape != bias.source_shape:
         # Druhá pojistka proti cizím obrázkům ve složce (exportované grafy,
@@ -1022,8 +1157,17 @@ def analyze_frame_file(
             f"rozlišení {frame.data.shape[1]}×{frame.data.shape[0]} px neodpovídá sérii "
             f"({bias.source_shape[1]}×{bias.source_shape[0]} px)"
         )
-    prepared = apply_geometry(frame.data, bias.binning, params.roi)
-    return analyze_prepared_frame(
+
+    binned = apply_binning(frame.data, bias.binning)
+    shift: Optional[FrameShift] = None
+    if alignment is not None and alignment.usable:
+        binned = repair_hot_pixels(binned, alignment.hot_mask)
+        shift = alignment.measure(binned)
+        if shift.ok:
+            binned = warp_to_anchor(binned, shift)
+    prepared = crop_to_roi(binned, params.roi, bias.binning)
+
+    metrics, masks = analyze_prepared_frame(
         image=prepared,
         bias=bias.data,
         params=params,
@@ -1036,6 +1180,19 @@ def analyze_frame_file(
         generate_masks=generate_masks,
         level_offset=bias.level_offset_adu,
     )
+
+    if shift is not None:
+        # Posun se hlásí v pixelech plného rozlišení, aby se dal převést na µm.
+        metrics.align_dx_px = shift.dx * bias.binning
+        metrics.align_dy_px = shift.dy * bias.binning
+        metrics.align_rotation_deg = shift.angle_deg
+        metrics.align_stars = shift.matched
+        metrics.align_rms_px = shift.rms_px * bias.binning
+        metrics.align_ok = shift.ok
+        if not shift.ok and shift.reason:
+            metrics.note = (metrics.note + "; " if metrics.note else "") + \
+                f"nezarovnáno ({shift.reason})"
+    return metrics, masks
 
 
 # ---------------------------------------------------------------------------
@@ -1229,11 +1386,70 @@ def resolve_workers(params: AnalysisParams, megapixels: float = 0.0) -> int:
     return requested
 
 
+def _report_alignment(
+    result: SeriesResult,
+    alignment: AlignmentModel,
+    metrics_list: Sequence[FrameMetrics],
+    params: AnalysisParams,
+) -> None:
+    """Doplní do výsledku poznámky a upozornění k zarovnání driftu."""
+    aligned = [m for m in metrics_list if m.align_ok]
+    failed = len(metrics_list) - len(aligned)
+
+    if not aligned:
+        # Není to chyba měření – na sérii bez výrazných částic prostě není co
+        # sledovat. Analýza doběhla se snímky v původní poloze.
+        result.notes.append(
+            "Snímky se nepodařilo zarovnat – souhvězdí částic nebylo nalezeno. "
+            "Pokud se scéna během měření hýbala, výsledky to zkreslí."
+        )
+        return
+
+    drift = max(math.hypot(m.align_dx_px, m.align_dy_px) for m in aligned)
+    stars = sum(m.align_stars for m in aligned) / len(aligned)
+    rotation = max(abs(m.align_rotation_deg) for m in aligned)
+    alignment.measured_drift_px = drift
+
+    crop_note = ""
+    if alignment.crop is not None:
+        crop_note = (f", ořezáno na {alignment.crop[2]}×{alignment.crop[3]} px "
+                     f"({alignment.crop_fraction * 100:.1f} % plochy)")
+    result.notes.append(
+        f"Snímky srovnány podle souhvězdí částic: největší drift {drift:.1f} px"
+        f" ({drift * params.um_per_px:.1f} µm), průměrně {stars:.0f} spárovaných částic"
+        f"{crop_note}."
+    )
+
+    if alignment.bias_shift is not None and alignment.bias_shift.ok:
+        shift = alignment.bias_shift
+        result.notes.append(
+            f"Referenční pozadí bylo posunuto o "
+            f"({shift.dx * alignment.binning:+.1f}, {shift.dy * alignment.binning:+.1f}) px, "
+            f"aby sedělo na sérii."
+        )
+
+    if failed:
+        result.warnings.append(
+            f"{failed} snímků se nepodařilo zarovnat (málo zřetelných částic) – "
+            "zůstaly v původní poloze, jejich hodnoty mohou být nadhodnocené."
+        )
+    if rotation > 0.05:
+        result.notes.append(f"Scéna se během měření pootočila až o {rotation:.2f}°.")
+
+    margin = alignment.crop_margin_px
+    if margin is not None and drift > margin:
+        result.warnings.append(
+            f"Drift {drift:.1f} px přesáhl rezervu ořezu ({margin:.1f} px). "
+            "Zvětšete ořez (režim „pevný podíl“) nebo zkontrolujte upevnění vzorku."
+        )
+
+
 def _build_bias(
     paths: Sequence[str],
     params: AnalysisParams,
     full_scale: float,
     result: SeriesResult,
+    alignment: Optional[AlignmentModel] = None,
 ) -> BiasModel:
     """Vybere zdroj referenčního pozadí a sestaví :class:`BiasModel`.
 
@@ -1249,7 +1465,7 @@ def _build_bias(
     """
     mode = (params.reference_mode or "auto").strip().lower()
     if mode in ("serie", "série", "series", "vypnuto", "off"):
-        return compute_bias(paths, params, full_scale=full_scale)
+        return compute_bias(paths, params, full_scale=full_scale, alignment=alignment)
 
     strict = mode in ("reference", "vzdy", "vždy")
     choice, directory = resolve_reference(paths, params)
@@ -1265,7 +1481,7 @@ def _build_bias(
         # V automatickém režimu je návrat k biasu ze série normální provoz,
         # ne chyba – proto jen poznámka, ne varovný dialog.
         result.notes.append(f"{message} Použit bias z prvních snímků série.")
-        return compute_bias(paths, params, full_scale=full_scale)
+        return compute_bias(paths, params, full_scale=full_scale, alignment=alignment)
 
     record = choice.record
     assert record is not None
@@ -1283,12 +1499,13 @@ def _build_bias(
             source_shape=probe.source_shape,
             full_scale=full_scale,
             rejected_paths=probe.rejected,
+            alignment=alignment,
         )
     except ReferenceError as exc:
         if strict:
             raise
         result.warnings.append(f"{exc} Použit bias z prvních snímků série.")
-        return compute_bias(paths, params, full_scale=full_scale)
+        return compute_bias(paths, params, full_scale=full_scale, alignment=alignment)
 
     result.reference = record
     result.reference_note = choice.reason
@@ -1307,7 +1524,8 @@ def _build_bias(
     if params.match_reference_level:
         rejected = {path for path, _reason in probe.rejected}
         usable = [path for path in paths if path not in rejected]
-        bias.level_offset_adu = estimate_reference_offset(usable, bias, params)
+        bias.level_offset_adu = estimate_reference_offset(
+            usable, bias, params, alignment=alignment)
         if abs(bias.level_offset_adu) > REFERENCE_LEVEL_WARN_ADU:
             direction = "světlejší" if bias.level_offset_adu > 0 else "tmavší"
             result.warnings.append(
@@ -1339,8 +1557,38 @@ def analyze_series(
 
     started = time.perf_counter()
     full_scale = probe_full_scale(paths)
+
+    # --- zarovnání driftu --------------------------------------------------
+    # Musí se rozhodnout dřív než cokoli jiného: určuje totiž bezpečný ořez,
+    # a ten už musí platit pro bias i pro každý snímek stejně.
+    alignment: Optional[AlignmentModel] = None
+    if bias is None and params.align_frames:
+        probe = probe_series_shape(paths, params, full_scale)
+        if probe.frames:
+            usable_paths = [p for p in paths if p not in dict(probe.rejected)]
+            try:
+                alignment = build_alignment(usable_paths, params, probe.source_shape, full_scale)
+            except (AlignmentError, cv2.error, MemoryError) as exc:
+                result.warnings.append(f"Zarovnání snímků se nezdařilo: {exc}")
+                alignment = None
+
+    if alignment is not None and not alignment.usable:
+        result.notes.extend(alignment.notes)
+        alignment = None
+
+    if alignment is not None:
+        try:
+            effective_roi = intersect_roi(params.roi, alignment.crop)
+        except AlignmentError as exc:
+            result.warnings.append(str(exc))
+            effective_roi = params.roi
+            alignment.crop = None
+        params = replace(params, roi=effective_roi)
+        result.params = params
+        result.alignment = alignment
+
     if bias is None:
-        bias = _build_bias(paths, params, full_scale, result)
+        bias = _build_bias(paths, params, full_scale, result, alignment=alignment)
     result.bias = bias
 
     if not bias.is_external and bias.frames_used < params.bias_frames:
@@ -1395,6 +1643,7 @@ def analyze_series(
                 timestamp=stamp,
                 t0=t0,
                 generate_masks=False,
+                alignment=alignment,
             )
             if path in bias_paths:
                 metrics.is_bias_frame = True
@@ -1447,6 +1696,9 @@ def analyze_series(
     collected.sort(key=lambda m: m.index)
     result.metrics = compute_rates_and_phases(collected)
     result.elapsed_s = time.perf_counter() - started
+
+    if alignment is not None and collected:
+        _report_alignment(result, alignment, collected, params)
 
     if result.failed_files:
         count = len(result.failed_files)

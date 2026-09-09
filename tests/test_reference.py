@@ -310,7 +310,7 @@ def test_series_uses_reference_and_keeps_every_frame(workspace):
     assert os.path.basename(result.bias.reference_path) == "reference_20260908_142910.npz"
     assert result.frame_count == len(workspace["paths"])     # nic neubylo
     assert not any(m.is_bias_frame for m in result.metrics)
-    assert result.notes and "14:29:10" in result.notes[0]
+    assert any("14:29:10" in note for note in result.notes)
     assert not result.warnings                                # nic k řešení
 
 

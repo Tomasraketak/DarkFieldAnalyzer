@@ -39,7 +39,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from analyzer import AnalysisParams, BiasModel, analyze_prepared_frame, apply_geometry
+from alignment import repair_hot_pixels, warp_to_anchor
+from analyzer import (
+    AnalysisParams,
+    BiasModel,
+    analyze_prepared_frame,
+    apply_binning,
+    apply_geometry,
+    crop_to_roi,
+)
 from frameio import build_time_axis, imwrite_unicode, load_frame
 
 #: Barvy jednotlivých kategorií kontaminace (RGB).
@@ -103,6 +111,7 @@ class ImageViewerWidget(QWidget):
         super().__init__(parent)
         self.image_paths: List[str] = []
         self.bias: Optional[BiasModel] = None
+        self.alignment = None
         self.params: Optional[AnalysisParams] = None
         self.timestamps: List = []
         self.current_index = 0
@@ -200,9 +209,11 @@ class ImageViewerWidget(QWidget):
 
     # -- data ---------------------------------------------------------------
 
-    def set_dataset(self, image_paths: List[str], bias: Optional[BiasModel], params: AnalysisParams) -> None:
+    def set_dataset(self, image_paths: List[str], bias: Optional[BiasModel],
+                    params: AnalysisParams, alignment=None) -> None:
         self.image_paths = list(image_paths)
         self.bias = bias
+        self.alignment = alignment
         self.params = params
         self.timestamps, _ = build_time_axis(self.image_paths, assumed_fps=params.assumed_fps)
 
@@ -266,7 +277,15 @@ class ImageViewerWidget(QWidget):
                 path, full_scale=self.bias.full_scale, mono_mode=self.params.mono_mode
             )
             binning = self.bias.binning * (2 if self.chk_fast.isChecked() else 1)
-            image = apply_geometry(frame.data, binning, self.params.roi)
+            # Náhled musí projít stejným srovnáním driftu jako analýza, jinak by
+            # se maska nekryla s tím, co uživatel na snímku vidí.
+            image = apply_binning(frame.data, binning)
+            if self.alignment is not None and self.alignment.usable and binning == self.bias.binning:
+                image = repair_hot_pixels(image, self.alignment.hot_mask)
+                shift = self.alignment.measure(image)
+                if shift.ok:
+                    image = warp_to_anchor(image, shift)
+            image = crop_to_roi(image, self.params.roi, binning)
 
             now = datetime.now()
             timestamp = self.timestamps[index] if index < len(self.timestamps) else now

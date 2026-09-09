@@ -74,6 +74,31 @@ rozptyluje světlo do objektivu a září.</p>
     hodnotu najdete v souhrnu i v exportovaném JSON.
 </div>
 
+<h3>1d. Zarovnání driftu sklíčka</h3>
+<div class="box">
+    <b>Proč:</b> Během dlouhého měření se sklíčko nebo kamera posune o jednotky až
+    desítky pixelů. Statické částice se pak přestanou krýt s referencí a zůstane
+    po nich <b>světlý půlměsíc</b>, který analýza počítá jako novou kontaminaci.
+    Změřeno na sérii s driftem 11 px: bez zarovnání 715 částic, se zarovnáním 57 –
+    a 57 je správná odpověď (stejná série bez driftu).<br>
+    <b>Jak:</b> Ze snímku se vybere 100 nejjasnějších prachových částic jako
+    „souhvězdí“ a pro každou dvojici částic se hlasuje o posunu. Skutečný posun
+    dostane tolik hlasů, kolik je společných částic; náhodné dvojice se rozptýlí.
+    Přesnost je lepší než desetina pixelu. Kotvou je vždy <b>první snímek</b>, ne
+    předchozí – chyby se tak nesčítají.<br>
+    <b>Vadné pixely:</b> Horké pixely senzoru se s driftem nepohybují, takže by
+    hlasovaly pro nulový posun. Poznají se podle toho, že jejich sousedé jsou na
+    úrovni pozadí (skutečná částice je rozmazaná optikou), vyloučí se z hledání
+    a nahradí mediánem okolí.<br>
+    <b>Ořez:</b> Po srovnání chybí u každého snímku pruh na okraji. Ořezává se
+    stejným podílem v obou osách, takže <b>poměr stran zůstává</b>.
+    <i>Podle driftu</i> (výchozí) ořízne jen tolik, kolik je nutné – u klidného
+    měření desetiny procenta. <i>Pevných 90 %</i> dá stejnou plochu bez ohledu na
+    drift, což se hodí, když chcete porovnávat různá měření mezi sebou.<br>
+    <b>Cena:</b> asi 94 ms na snímek při binningu 2. Kdyby se nenašlo dost
+    výrazných částic, zarovnání se tiše vypne a napíše to v poznámkách.
+</div>
+
 <h3>1c. Barevné a černobílé snímky</h3>
 <div class="box">
     Aplikace zpracuje obojí. Barevný snímek se převede na intenzitu podle volby
@@ -210,6 +235,13 @@ rozptyluje světlo do objektivu a září.</p>
 <tr><td>Použila se jiná reference, než jsem čekal</td>
     <td>Vybírá se poslední pořízená <i>před</i> měřením. Zkontrolujte čas v názvu
     souboru <code>reference_RRRRMMDD_HHMMSS.npz</code>; složku lze určit i ručně.</td></tr>
+<tr><td>Najednou skokově vyskočí počet částic</td>
+    <td>Zkontrolujte v souhrnu <b>Drift scény</b>. Když je velký a zarovnání
+    hlásí málo spárovaných částic, vzorek se pravděpodobně posunul víc, než
+    stačí sledovat – zkontrolujte upevnění.</td></tr>
+<tr><td>Analýza je pomalejší než dřív</td>
+    <td>Zarovnání stojí asi 94 ms na snímek. Když se vzorek prokazatelně nehýbe,
+    dá se vypnout zaškrtávátkem <b>Srovnat drift sklíčka / kamery</b>.</td></tr>
 <tr><td>Barevné snímky vycházejí jinak než mono</td>
     <td>Zkontrolujte volbu <b>Barevný snímek jako</b> – na referenci
     <code>mean_mono</code> sedí <i>Vážený jas (Rec.601)</i>.</td></tr>

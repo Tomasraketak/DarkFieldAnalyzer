@@ -76,6 +76,11 @@ CSV_COLUMNS: List[tuple] = [
     ("Rychlost signálu [ADU/s]", "rate_signal_adu_per_s", "{:.4f}"),
     ("Rychlost částic [ks/s]", "rate_particles_per_s", "{:.2f}"),
     ("Fáze děje", "phase", None),
+    ("Drift X [px]", "align_dx_px", "{:.2f}"),
+    ("Drift Y [px]", "align_dy_px", "{:.2f}"),
+    ("Drift – pootočení [°]", "align_rotation_deg", "{:.3f}"),
+    ("Drift – spárovaných částic", "align_stars", "{:d}"),
+    ("Drift – zbytková odchylka [px]", "align_rms_px", "{:.3f}"),
 ]
 
 
@@ -122,6 +127,7 @@ def export_to_csv(
             writer.writerow(["# Počet snímků biasu", params.bias_frames])
             writer.writerow(["# Metoda biasu", params.bias_method])
             writer.writerow(["# Převod barvy na intenzitu", params.mono_label])
+            writer.writerow(["# Zarovnání driftu", "ano" if params.align_frames else "ne"])
             writer.writerow(["# Binning", params.resolution_label])
             writer.writerow(["# Režim prahu", params.threshold_mode])
             writer.writerow(["# Sigma násobek šumu", _fmt(params.sigma, "{:.2f}", decimal_comma)])
@@ -196,7 +202,36 @@ def summarize(result: SeriesResult) -> Dict[str, object]:
         "poznamky": list(result.notes),
         "synteticka_casova_osa": result.synthetic_time_axis,
         "pozadi": _background_summary(result),
+        "zarovnani": _alignment_summary(result),
     }
+
+
+def _alignment_summary(result: SeriesResult) -> Dict[str, object]:
+    """Souhrn zarovnání driftu (prázdný slovník, když se nezarovnávalo)."""
+    model = result.alignment
+    if model is None:
+        return {}
+
+    aligned = [m for m in result.metrics if m.align_ok]
+    info: Dict[str, object] = {
+        "kotva": os.path.basename(model.anchor_path),
+        "castic_v_souhvezdi": model.anchor.count,
+        "horkych_pixelu": model.hot_pixel_count,
+        "zarovnano_snimku": len(aligned),
+        "snimku_celkem": len(result.metrics),
+        "max_drift_px": round(float(model.measured_drift_px), 3),
+    }
+    if aligned and result.params is not None and result.params.um_per_px > 0:
+        info["max_drift_um"] = round(float(model.measured_drift_px) * result.params.um_per_px, 3)
+    if model.crop is not None:
+        info["orez_px"] = list(model.crop)
+        info["orez_podil"] = round(float(model.crop_fraction), 4)
+    if model.bias_shift is not None and model.bias_shift.ok:
+        info["posun_reference_px"] = [
+            round(model.bias_shift.dx * model.binning, 3),
+            round(model.bias_shift.dy * model.binning, 3),
+        ]
+    return info
 
 
 def _background_summary(result: SeriesResult) -> Dict[str, object]:

@@ -397,3 +397,126 @@ print("  -> 04_faze.png")
 print("fáze:", {p: sum(1 for m in series if m.phase == p) for p in PHASE_COLOR})
 print(f"pokrytí {cov[0]:.2f} % → max {cov.max():.2f} % → konec {cov[-1]:.2f} %; "
       f"částic {cnt[0]} → {cnt[-1]}")
+
+# ==========================================================================
+# 5) Drift scény: co způsobí a co s tím udělá zarovnání
+# ==========================================================================
+from alignment import (FrameShift, detect_stars, estimate_shift,  # noqa: E402
+                       find_hot_pixels, repair_hot_pixels, warp_to_anchor)
+
+DRIFT = (7.0, -5.0)
+static_specs = [(rng.uniform(50, W - 50), rng.uniform(50, H - 50),
+                 rng.uniform(1.8, 3.0), rng.uniform(80, 190)) for _ in range(90)]
+hot_specs = [(int(rng.integers(20, W - 20)), int(rng.integers(20, H - 20))) for _ in range(35)]
+
+
+#: Vinětace patří OPTICE – s driftem sklíčka se neposouvá (na rozdíl od jeho obsahu).
+_gy, _gx = np.mgrid[0:H, 0:W].astype(np.float32)
+VIGNETTE = 1.0 - 1.6 * (((_gx / W - 0.5) ** 2) + ((_gy / H - 0.5) ** 2))
+
+
+def drift_scene(dx=0.0, dy=0.0, extra=0, noise=1.0, seed=0):
+    """Fyzikálně poctivá scéna s driftem.
+
+    Posouvá se **celý obsah sklíčka** – jeho struktura i všechny částice.
+    Vinětace optiky a vadné pixely senzoru zůstávají pevné vůči kameře.
+    """
+    slide = BIAS.copy()
+    for cx, cy, radius, amp in static_specs:
+        add_blob(slide, cx, cy, radius, amp)
+    fresh = np.random.default_rng(4242)
+    for _ in range(extra):
+        add_blob(slide, fresh.uniform(50, W - 50), fresh.uniform(50, H - 50),
+                 fresh.uniform(1.6, 2.4), fresh.uniform(70, 150))
+    if dx or dy:
+        slide = cv2.warpAffine(slide, np.float32([[1, 0, dx], [0, 1, dy]]), (W, H),
+                               flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+
+    image = slide * VIGNETTE + np.random.default_rng(seed).normal(0, noise, (H, W)).astype(np.float32)
+    for hx, hy in hot_specs:
+        image[hy, hx] += 210.0
+    return np.clip(image, 0, 255)
+
+
+reference_frame = drift_scene(seed=0)
+drifted_frame = drift_scene(*DRIFT, extra=10, seed=1)
+
+hot = find_hot_pixels(reference_frame)
+anchor_stars = detect_stars(repair_hot_pixels(reference_frame, hot), hot_mask=hot)
+measured = estimate_shift(anchor_stars, detect_stars(repair_hot_pixels(drifted_frame, hot), hot_mask=hot))
+aligned_frame = warp_to_anchor(repair_hot_pixels(drifted_frame, hot), measured)
+clean_reference = repair_hot_pixels(reference_frame, hot)
+print(f"drift: skutečnost ({DRIFT[0]:+.2f},{DRIFT[1]:+.2f}) → naměřeno "
+      f"({measured.dx:+.2f},{measured.dy:+.2f}) z {measured.matched} částic")
+
+
+def detections(frame, reference):
+    diff = cv2.subtract(frame, reference)
+    haze, _small = separate_haze(diff)
+    sharp = cv2.subtract(diff, haze)
+    median, sigma = estimate_noise(sharp)
+    mask = (sharp > max(median + 4.0 * sigma, 1.5)).astype(np.uint8)
+    count, labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8, cv2.CV_32S)
+    keep = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= 3)
+    keep = keep[keep != 0]
+    return diff, len(keep)
+
+
+diff_bad, n_bad = detections(drifted_frame, clean_reference)
+diff_good, n_good = detections(aligned_frame, clean_reference)
+print(f"detekcí: bez zarovnání {n_bad}, se zarovnáním {n_good} (skutečně přibylo 10)")
+
+fig = plt.figure(figsize=(15.5, 7.4))
+grid = fig.add_gridspec(2, 3, height_ratios=[1.25, 1], hspace=0.32, wspace=0.16)
+
+ax = fig.add_subplot(grid[0, 0])
+ax.imshow(reference_frame, cmap="gray", vmin=0, vmax=60)
+for point in anchor_stars.points[:60]:
+    ax.add_patch(plt.Circle((point[0], point[1]), 9, fill=False, ec=C_FIBER, lw=1.1))
+ax.set_title(f"Souhvězdí v kotvě\n{anchor_stars.count} zřetelných částic", pad=6)
+ax.set_xticks([]); ax.set_yticks([])
+
+ax = fig.add_subplot(grid[0, 1])
+ax.imshow(np.abs(diff_bad), cmap="gray", vmin=0, vmax=40)
+ax.set_title(f"|snímek − reference| BEZ zarovnání\nkaždá statická částice = dipól → "
+             f"{n_bad} detekcí", pad=6, color=C_CLUSTER)
+ax.set_xticks([]); ax.set_yticks([])
+
+ax = fig.add_subplot(grid[0, 2])
+ax.imshow(np.abs(diff_good), cmap="gray", vmin=0, vmax=40)
+ax.set_title(f"|snímek − reference| SE zarovnáním\nzůstane jen skutečný přírůstek → "
+             f"{n_good} detekcí", pad=6, color=C_FIBER)
+ax.set_xticks([]); ax.set_yticks([])
+
+# --- jak roste chyba s velikostí driftu ---------------------------------
+ax = fig.add_subplot(grid[1, :])
+shifts = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
+without, with_align = [], []
+for value in shifts:
+    frame = drift_scene(value, -value * 0.7, extra=10, seed=2)
+    without.append(detections(frame, clean_reference)[1])
+    clean = repair_hot_pixels(frame, hot)
+    shift = estimate_shift(anchor_stars, detect_stars(clean, hot_mask=hot))
+    with_align.append(detections(warp_to_anchor(clean, shift), clean_reference)[1])
+
+magnitudes = [math.hypot(v, v * 0.7) for v in shifts]
+ax.plot(magnitudes, without, color=C_CLUSTER, lw=2, marker="o", ms=7,
+        markeredgecolor=SURFACE, markeredgewidth=2, label="bez zarovnání")
+ax.plot(magnitudes, with_align, color=C_FIBER, lw=2, marker="o", ms=7,
+        markeredgecolor=SURFACE, markeredgewidth=2, label="se zarovnáním")
+ax.axhline(10, color=MUTED, ls="--", lw=1.4)
+ax.text(magnitudes[-1], 11, "skutečný počet nových částic  ", ha="right", va="bottom",
+        color=MUTED, fontsize=9)
+ax.set_xlabel("drift scény [px]")
+ax.set_ylabel("nalezených objektů")
+ax.set_title("Chyba roste už od jednoho pixelu – a zarovnání ji drží na skutečné hodnotě")
+ax.legend(frameon=False, fontsize=9.5, loc="upper left")
+ax.grid(color=GRID, lw=0.8)
+ax.set_axisbelow(True)
+
+fig.suptitle("Drift sklíčka: proč se snímky musí srovnat", fontsize=13, fontweight="bold",
+             color=INK, y=0.985)
+fig.savefig(os.path.join(OUT, "05_drift.png"), dpi=115, bbox_inches="tight")
+plt.close(fig)
+print("  -> 05_drift.png")
+print("  detekce podle driftu:", list(zip([round(m,1) for m in magnitudes], without, with_align)))

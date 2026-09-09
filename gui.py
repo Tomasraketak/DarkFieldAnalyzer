@@ -75,6 +75,9 @@ DEFAULT_BASE_DIR = r"C:\Users\Programovani\Downloads\BMS fotky"
 #: Volby režimu referenčního pozadí – pořadí odpovídá položkám v rozbalovacím seznamu.
 REFERENCE_MODES: Tuple[str, ...] = ("auto", "reference", "serie")
 
+#: Volby ořezu po zarovnání driftu – pořadí odpovídá rozbalovacímu seznamu.
+ALIGN_CROP_MODES: Tuple[str, ...] = ("auto", "fixed", "none")
+
 #: Volby převodu barevného snímku na intenzitu (klíč pro ``AnalysisParams.mono_mode``).
 MONO_CHOICES: Tuple[Tuple[str, str], ...] = (
     ("luma", "Vážený jas – Rec.601 (doporučeno)"),
@@ -342,6 +345,34 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             "font-size: 10px; color: #1D3B5C; background: #EAF2FA; padding: 4px; border-radius: 4px;"
         )
         ref_layout.addWidget(self.lbl_reference_pick)
+
+        self.chk_align = QCheckBox("Srovnat drift sklíčka / kamery")
+        self.chk_align.setChecked(True)
+        self.chk_align.setToolTip(
+            "Během dlouhého měření se scéna posune o jednotky až desítky pixelů.\n"
+            "Statické částice se pak přestanou krýt s referencí a zůstanou po nich\n"
+            "světlé půlměsíce, které analýza počítá jako novou kontaminaci.\n"
+            "Zarovnání sleduje „souhvězdí“ prachových částic a snímky srovná."
+        )
+        ref_layout.addWidget(self.chk_align)
+
+        align_row = QWidget()
+        align_layout = QHBoxLayout(align_row)
+        align_layout.setContentsMargins(16, 0, 0, 0)
+        align_layout.setSpacing(4)
+        align_layout.addWidget(QLabel("ořez:"))
+        self.combo_align_crop = QComboBox()
+        self.combo_align_crop.addItems([
+            "podle driftu", "pevných 90 %", "neořezávat",
+        ])
+        self.combo_align_crop.setToolTip(
+            "Po srovnání chybí u každého snímku pruh na okraji.\n"
+            "„Podle driftu“ ořeže jen tolik, kolik je nutné (obvykle jednotky procent).\n"
+            "„Pevných 90 %“ dá stejnou plochu bez ohledu na drift – srovnatelné mezi měřeními."
+        )
+        align_layout.addWidget(self.combo_align_crop, 1)
+        ref_layout.addWidget(align_row)
+        self.chk_align.toggled.connect(self.combo_align_crop.setEnabled)
 
         self.chk_match_level = QCheckBox("Srovnat úroveň reference se snímky")
         self.chk_match_level.setChecked(True)
@@ -622,6 +653,9 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.chk_exclude_bias.setChecked(s.value("exclude_bias", True, type=bool))
         self.combo_reference.setCurrentIndex(s.value("reference_mode", 0, type=int))
         self.chk_match_level.setChecked(s.value("match_reference_level", True, type=bool))
+        self.chk_align.setChecked(s.value("align_frames", True, type=bool))
+        self.combo_align_crop.setCurrentIndex(s.value("align_crop", 0, type=int))
+        self.combo_align_crop.setEnabled(self.chk_align.isChecked())
         self.combo_mono.setCurrentIndex(s.value("mono_mode", 0, type=int))
         stored_dir = s.value("reference_dir", "", type=str)
         self.reference_dir_override = stored_dir if stored_dir and os.path.isdir(stored_dir) else None
@@ -649,6 +683,8 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         s.setValue("exclude_bias", self.chk_exclude_bias.isChecked())
         s.setValue("reference_mode", self.combo_reference.currentIndex())
         s.setValue("match_reference_level", self.chk_match_level.isChecked())
+        s.setValue("align_frames", self.chk_align.isChecked())
+        s.setValue("align_crop", self.combo_align_crop.currentIndex())
         s.setValue("mono_mode", self.combo_mono.currentIndex())
         s.setValue("reference_dir", self.reference_dir_override or "")
         s.setValue("roi_enabled", self.chk_roi.isChecked())
@@ -673,6 +709,8 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         self.spin_workers.setValue(defaults.workers)
         self.combo_reference.setCurrentIndex(0)
         self.chk_match_level.setChecked(defaults.match_reference_level)
+        self.chk_align.setChecked(defaults.align_frames)
+        self.combo_align_crop.setCurrentIndex(0)
         self.combo_mono.setCurrentIndex(0)
         self.reference_dir_override = None
         self.chk_roi.setChecked(False)
@@ -711,6 +749,8 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             reference_dir=self.reference_dir_override,
             match_reference_level=self.chk_match_level.isChecked(),
             mono_mode=MONO_CHOICES[self.combo_mono.currentIndex()][0],
+            align_frames=self.chk_align.isChecked(),
+            align_crop_mode=ALIGN_CROP_MODES[self.combo_align_crop.currentIndex()],
         )
 
     # -- složky -------------------------------------------------------------
@@ -928,7 +968,8 @@ class DarkfieldAnalyzerGUI(QMainWindow):
             item.setText("Analyzováno")
             item.setForeground(QColor("#27AE60"))
 
-        self.viewer_widget.set_dataset(self.current_image_paths, result.bias, result.params)
+        self.viewer_widget.set_dataset(
+            self.current_image_paths, result.bias, result.params, result.alignment)
         self.plot_all_graphs()
         self.populate_results_table()
         self.populate_summary()
@@ -1113,10 +1154,21 @@ class DarkfieldAnalyzerGUI(QMainWindow):
         else:
             background = f"prvních {bias.frames_used} snímků série ({self.current_result.params.bias_method})"
 
+        model = self.current_result.alignment
+        if model is None:
+            drift = "snímky se nesrovnávaly"
+        else:
+            aligned = sum(1 for m in self.current_result.metrics if m.align_ok)
+            crop = (f", ořez {model.crop[2]}×{model.crop[3]} px "
+                    f"({model.crop_fraction * 100:.1f} %)") if model.crop else ""
+            drift = (f"největší <b>{model.measured_drift_px:.1f} px</b>, "
+                     f"zarovnáno {aligned}/{len(self.current_result.metrics)} snímků{crop}")
+
         html = f"""
         <h2 style='color:#1B4F72;'>Souhrn měření</h2>
         <table cellpadding='6' style='border-collapse:collapse;'>
           <tr><td><b>Referenční pozadí</b></td><td>{background}</td></tr>
+          <tr><td><b>Drift scény</b></td><td>{drift}</td></tr>
           <tr><td><b>Snímků</b></td><td>{data['pocet_snimku']}</td></tr>
           <tr><td><b>Délka měření</b></td><td>{data['delka_mereni_s']:.2f} s</td></tr>
           <tr><td><b>Průměrné pokrytí</b></td><td>{data['pokryti_prumer_pct']:.3f} %</td></tr>

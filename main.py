@@ -71,6 +71,10 @@ def build_params(args: argparse.Namespace) -> AnalysisParams:
         reference_dir=args.reference_dir,
         match_reference_level=not args.no_level_match,
         mono_mode=args.mono,
+        align_frames=not args.no_align,
+        align_crop_mode=args.align_crop,
+        align_star_count=args.align_stars,
+        align_max_shift_px=args.align_max_shift,
     )
 
 
@@ -117,6 +121,13 @@ def run_folder(folder: str, args: argparse.Namespace) -> int:
 
     per_frame = result.elapsed_s / len(result.metrics) * 1000.0
     print(f"Hotovo za {result.elapsed_s:.2f} s ({per_frame:.1f} ms/snímek).")
+    if result.alignment is not None:
+        model = result.alignment
+        aligned = sum(1 for m in result.metrics if m.align_ok)
+        crop = (f"   |   ořez {model.crop[2]}×{model.crop[3]} px"
+                f" ({model.crop_fraction * 100:.1f} %)") if model.crop else ""
+        print(f"  Drift: největší {model.measured_drift_px:.1f} px, "
+              f"zarovnáno {aligned}/{len(result.metrics)} snímků{crop}")
     if result.bias is not None:
         print(f"  Pozadí: {result.bias.origin_label}"
               + (f"   |   srovnání úrovně {result.bias.level_offset_adu:+.2f} ADU"
@@ -192,6 +203,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nesrovnávat úroveň externí reference se snímky")
     parser.add_argument("--mono", choices=["luma", "prumer", "maximum", "r", "g", "b"], default="luma",
                         help="Převod barevného snímku na intenzitu")
+    parser.add_argument("--no-align", action="store_true",
+                        help="Nezarovnávat snímky podle souhvězdí částic (drift sklíčka)")
+    parser.add_argument("--align-crop", choices=["auto", "fixed", "none"], default="auto",
+                        help="Ořez po zarovnání: podle driftu / pevný podíl / žádný")
+    parser.add_argument("--align-stars", type=int, default=100,
+                        help="Kolik částic tvoří souhvězdí pro zarovnání")
+    parser.add_argument("--align-max-shift", type=int, default=60,
+                        help="Největší uvažovaný drift [px]")
     parser.add_argument("--roi", help="Výřez k analýze ve tvaru x,y,sirka,vyska (px plného rozlišení)")
     parser.add_argument("--export", help="Cesta k výstupnímu CSV")
     parser.add_argument("--quiet", action="store_true", help="Nevypisovat průběh")

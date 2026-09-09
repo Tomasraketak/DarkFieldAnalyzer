@@ -148,6 +148,43 @@ Ověřeno na skutečné referenci ze 4K kamery: při referenci posunuté o −6 
 hlásila analýza bez srovnání 100 % zamlžení na čistém sklíčku, se srovnáním
 0 % – stejně jako s referencí, která sedí.
 
+### Zarovnání driftu sklíčka
+
+Během dlouhého měření se sklíčko nebo kamera posune o jednotky až desítky
+pixelů. Statické částice se pak přestanou krýt s referencí, zůstanou po nich
+světlé půlměsíce a analýza je počítá jako novou kontaminaci.
+
+Před analýzou se proto ze snímků sestaví „souhvězdí“ **100 nejjasnějších
+prachových částic** a sleduje se, jak se během měření posouvá:
+
+- **Hlasování o posunu.** Pro každou dvojici (částice v kotvě, částice ve
+  snímku) se hlasuje pro jejich rozdíl; skutečný posun dostane tolik hlasů,
+  kolik je společných částic. Zvládne to i posun větší než rozestup částic
+  a nevadí mu, že kontaminace během měření přibývá. Naměřená přesnost je
+  **lepší než 0,1 px**.
+- **Pojistka proti vadným pixelům.** Horké pixely se s driftem nepohybují, takže
+  by hlasovaly pro nulový posun. Poznají se podle toho, že jejich sousedé jsou
+  na úrovni pozadí (skutečná částice je rozmazaná optikou), vyloučí se z hledání
+  a nahradí mediánem okolí. Změřeno: bez pojistky přehlasuje 60 vadných pixelů
+  20 skutečných částic a posun vyjde (0,00; 0,00) místo (+8,0; −5,0).
+- **Interpolace Lanczosem.** Bilineární interpolace snímek rozmaže a kolem každé
+  statické částice vyrobí falešnou detekci (37 na poli 120 částic); Lanczos jen 3.
+- **Ořez okraje** stejným podílem v obou osách (poměr stran zůstává). Ve výchozím
+  režimu se ořezává jen podle naměřeného driftu, volitelně pevných 90 %.
+- Kotvou je první snímek, ne předchozí — chyby se tak nesčítají. Srovnává se
+  i referenční pozadí.
+
+Měřeno na sérii s driftem 11 px, kde skutečně přibylo 60 částic:
+
+| | částic na konci | pokrytí |
+|---|---|---|
+| bez driftu (správná odpověď) | 57 | 0,549 % |
+| s driftem, bez zarovnání | **715** | **53,4 %** |
+| s driftem, se zarovnáním | **57** | 0,618 % |
+
+Zarovnání stojí asi 94 ms na snímek při binningu 2. Vypíná se zaškrtávátkem
+v GUI nebo přepínačem `--no-align`.
+
 ### Barevné i černobílé snímky
 
 Barevný snímek se převede na intenzitu jedním z režimů (`--mono`, v GUI
@@ -207,7 +244,8 @@ Naměřený výkon (4K snímky, 12 kusů, testovací stroj):
 2. **Referenční pozadí (bias)** – režim (automaticky / vždy ze složky / vždy ze
    série), volba složky s referencemi, zaškrtávátko *Srovnat úroveň reference se
    snímky* a modrý řádek s tím, **která reference se právě použije** a jak dlouho
-   před měřením vznikla. Náhled se obnovuje hned po výběru složky.
+   před měřením vznikla. Náhled se obnovuje hned po výběru složky. Tady je
+   i *Srovnat drift sklíčka / kamery* a volba ořezu po srovnání.
 3. **Parametry analýzy** – rozlišení/binning, počet a metoda bias snímků, převod
    barevného snímku na intenzitu, režim a hodnota prahu, práh zamlžení, hranice
    hotspotu, minimální plocha částice, hranice velkého shluku, protáhlost a délka
@@ -271,6 +309,9 @@ Nejdůležitější přepínače (`py main.py --help` vypíše všechny):
 | `--reference-dir` | složka s `.npz` referencemi | hledá se `reference` |
 | `--no-level-match` | nesrovnávat úroveň externí reference | srovnává se |
 | `--mono` | převod barvy: `luma`/`prumer`/`maximum`/`r`/`g`/`b` | `luma` |
+| `--no-align` | nezarovnávat snímky podle souhvězdí částic | zarovnává se |
+| `--align-crop` | ořez po zarovnání: `auto`/`fixed`/`none` | `auto` |
+| `--align-stars`, `--align-max-shift` | velikost souhvězdí a mez posunu | 100, 60 px |
 
 ---
 
@@ -312,6 +353,8 @@ lze zobrazit – v CSV jsou označené ve sloupci *Bias snímek*.
 
 ```
 analyzer.py              analytické jádro (bez závislosti na GUI)
+alignment.py             srovnání driftu podle souhvězdí prachových částic
+imageops.py              odhad šumu a separace oparu (sdílí analyzer i alignment)
 frameio.py               načítání snímků, Unicode cesty, časová razítka, převod barvy
 reference.py             hledání, výběr a načtení reference z .npz + .json
 exporter.py              CSV, souhrnné grafy, JSON souhrn
@@ -333,6 +376,6 @@ py -m pip install pytest
 py -m pytest -q
 ```
 
-95 testů pokrývá jádro, výběr reference, barevné snímky, export i grafické
-rozhraní (běží bez obrazovky přes `QT_QPA_PLATFORM=offscreen`), včetně regresí
+120 testů pokrývá jádro, zarovnání driftu, výběr reference, barevné snímky,
+export i grafické rozhraní (běží bez obrazovky přes `QT_QPA_PLATFORM=offscreen`), včetně regresí
 na všechny tři výše popsané pády.
